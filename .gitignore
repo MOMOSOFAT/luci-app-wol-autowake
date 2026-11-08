@@ -11,3 +11,19 @@ Thumbs.db
 
 # 本地测试
 /test/
+
+# ★ 密钥与凭证：绝对不要提交
+*.key
+*.pem
+*.p12
+*.pfx
+id_rsa
+id_rsa.pub
+id_ed25519
+id_ed25519.pub
+.router_key
+.env
+.env.*
+secrets.*
+*secret*
+*credential*
