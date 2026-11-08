@@ -1,0 +1,32 @@
+{
+	"luci-app-wol-autowake": {
+		"description": "Grant access to WOL autowake configuration",
+		"read": {
+			"uci": [ "wol_autowake" ],
+			"file": {
+				"/etc/config/wol_autowake": [ "read" ],
+				"/usr/bin/wol-wake": [ "exec" ],
+				"/usr/bin/wol-status": [ "exec" ],
+				"/etc/init.d/wol-autowake": [ "exec" ],
+				"/usr/libexec/wol-autowake.sh": [ "read" ],
+				"/www/luci-static/resources/view/wol-autowake/*": [ "read" ]
+			},
+			"ubus": {
+				"service": [ "list" ],
+				"file": [ "exec", "read", "stat" ]
+			}
+		},
+		"write": {
+			"uci": [ "wol_autowake" ],
+			"file": {
+				"/etc/config/wol_autowake": [ "write" ],
+				"/usr/bin/wol-wake": [ "exec" ],
+				"/usr/bin/wol-status": [ "exec" ],
+				"/etc/init.d/wol-autowake": [ "exec" ]
+			},
+			"ubus": {
+				"file": [ "exec" ]
+			}
+		}
+	}
+}
