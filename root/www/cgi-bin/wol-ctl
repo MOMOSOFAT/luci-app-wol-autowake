@@ -1,0 +1,261 @@
+#!/bin/sh
+# ==============================================================================
+# wol-ctl (CGI) -- 执行动作
+#
+#   GET /cgi-bin/wol-ctl?q=wake:<名称|MAC|端口>        唤醒指定设备
+#   GET /cgi-bin/wol-ctl?q=wakeall                     唤醒全部
+#   GET /cgi-bin/wol-ctl?q=restart                     重启 wol-autowake 服务
+#   GET /cgi-bin/wol-ctl?q=logclean                    立刻跑一次日志清理
+#   GET /cgi-bin/wol-ctl?q=sync                        把全部设备同步到防火墙设置
+#   GET /cgi-bin/wol-ctl?q=setfw:<名称|MAC|端口>:<0|1> 设置某台设备的「启用转发」并立刻生效
+#   GET /cgi-bin/wol-ctl?q=block:<ip>                  把 IP 加入手动黑名单
+#   GET /cgi-bin/wol-ctl?q=unblock:<ip>                把 IP 移出手动黑名单
+#   GET /cgi-bin/wol-ctl?q=cnlist                      重建国内 IP 表
+#   GET /cgi-bin/wol-ctl?q=cnlist_status               查看国内 IP 表状态
+#
+# 返回: {"ok":bool,"result":"..."}
+#
+# 安全说明: 只暴露【幂等】【无害】的动作 ——
+#   · sync / setfw 完全以 UCI 配置为准，重复调用结果一样
+#   · 唯一"副作用"是给规则补日志（自动唤醒的触发来源），不开放任何流量
+#   · 只改 enabled / name / dest_*，绝不删除规则
+# ==============================================================================
+
+. /lib/functions.sh
+. /usr/libexec/wol-fw.sh
+
+echo "Content-Type: application/json"
+echo "Cache-Control: no-store"
+echo ""
+
+case "${REMOTE_ADDR:-}" in
+	127.*|::1|10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*|100.*|fd*|fe80*) ;;
+	*) printf '{"ok":false,"result":"forbidden"}\n'; exit 0 ;;
+esac
+
+jesc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\r//g' | tr '\n' ' '; }
+emit() { printf '{"ok":%s,"result":"%s"}\n' "$1" "$(jesc "$2")"; }
+
+# ------------------------------------------------------------------ URL 解码
+q=$(printf '%s' "${QUERY_STRING:-}" \
+	| sed -e 's/^.*[?&]q=//' -e 's/^q=//' -e 's/&.*$//' -e 's/+/ /g')
+q=$(printf '%s' "$q" \
+	| sed -e 's/%3[Aa]/:/g' -e 's/%2[Ff]/\//g' -e 's/%20/ /g' \
+	      -e 's/%2[Dd]/-/g' -e 's/%2[Ee]/./g' -e 's/%5[Ff]/_/g')
+
+config_load wol_autowake
+
+# ------------------------------------------------------------------ 同步逻辑
+SYNC_N=0; SYNC_CREATED=0; SYNC_ON=0; SYNC_OFF=0; SYNC_LOGFIX=0; SYNC_SKIP=0
+
+# 同步单台设备：确保规则存在 -> 补日志 -> 应用启用状态
+sync_one() {
+	local s="$1" name port ip dport proto
+	local res created sec ours nowen
+
+	config_get name  "$s" name
+	config_get port  "$s" port
+	config_get ip    "$s" ip
+	config_get dport "$s" dest_port
+	config_get proto "$s" proto
+	config_get_bool en "$s" fw_enabled 0
+
+	if [ -z "$port" ] || [ -z "$ip" ]; then
+		SYNC_SKIP=$((SYNC_SKIP + 1))
+		return 0
+	fi
+	SYNC_N=$((SYNC_N + 1))
+
+	res=$(fw_ensure "$port" "$ip" "${dport:-3389}" "${proto:-tcp}" "$en" "WOLAUTO-$port")
+	[ -n "$res" ] || { SYNC_SKIP=$((SYNC_SKIP + 1)); return 0; }
+
+	created=${res%%|*}; res=${res#*|}
+	sec=${res%%|*};     res=${res#*|}
+	ours=${res%%|*};    nowen=${res##*|}
+
+	[ "$created" = "1" ] && SYNC_CREATED=$((SYNC_CREATED + 1))
+	[ "$nowen" = "1" ]   && SYNC_ON=$((SYNC_ON + 1)) || SYNC_OFF=$((SYNC_OFF + 1))
+	fw_has_log "$sec" && SYNC_LOGFIX=$((SYNC_LOGFIX + 1))
+
+	# IPv6 放行：按设备的 ipv6_allow 决定建/删（IPv6 没有 NAT，只是一条 ACCEPT）
+	config_get_bool v6 "$s" ipv6_allow 0
+	case "$v6" in 1) ;; *) v6=0 ;; esac
+	fw_ensure6 "$port" "$v6" "$v6" >/dev/null 2>&1 || true
+
+	return 0
+}
+
+sync_all() {
+	SYNC_N=0; SYNC_CREATED=0; SYNC_ON=0; SYNC_OFF=0; SYNC_LOGFIX=0; SYNC_SKIP=0
+	config_foreach sync_one device
+
+	# 内网走公网也触发唤醒的 nft 规则：按设置项生成 / 删除
+	local hp
+	config_get_bool hp settings wake_hairpin 0
+	fw_hairpin "$hp" >/dev/null 2>&1
+
+	fw_commit_reload
+}
+
+# ------------------------------------------------------------------ 按 端口/MAC/名称 找设备
+FS_WANT=""
+FS_FOUND=""
+
+_find_match() {
+	local s="$1" port mac name
+	config_get port "$s" port
+	config_get mac  "$s" mac
+	config_get name "$s" name
+	case "$port" in
+		"") return 0 ;;
+	esac
+	case "$FS_WANT" in
+		"$port"|"$mac"|"$name") FS_FOUND="$s" ;;
+	esac
+	return 0
+}
+
+find_section() {
+	FS_WANT="$1"
+	FS_FOUND=""
+	config_foreach _find_match device
+}
+
+# ------------------------------------------------------------------ 分发
+case "$q" in
+	restart)
+		out=$(/etc/init.d/wol-autowake restart 2>&1)
+		emit true "${out:-服务已重启}"
+		;;
+
+	wakeall)
+		out=$(/usr/bin/wol-wake --all 2>&1)
+		emit true "$out"
+		;;
+
+	wake:*)
+		arg=${q#wake:}
+		out=$(/usr/bin/wol-wake "$arg" 2>&1)
+		emit true "$out"
+		;;
+
+	logclean)
+		rm -f /tmp/wol-logclean.ts 2>/dev/null
+		out=$(/usr/bin/wol-logclean 2>&1)
+		emit true "${out:-日志清理已执行}"
+		;;
+
+	# ---- 重建 / 查看国内 IP 表 ----
+	cnlist)
+		out=$(/usr/bin/wol-cnlist build 2>&1)
+		emit true "${out:-操作完成}"
+		;;
+
+	cnlist_status)
+		out=$(/usr/bin/wol-cnlist status 2>&1)
+		emit true "$out"
+		;;
+
+	# ---- 手动黑名单 ----
+	block:*)
+		ip=${q#block:}
+		[ -n "$ip" ] || { emit false "缺少 IP"; exit 0; }
+		cur=$(uci -q get wol_autowake.settings.blacklist)
+		case " $cur " in
+			*" $ip "*) emit true "$ip 已经在黑名单里了"; exit 0 ;;
+		esac
+		uci set "wol_autowake.settings.blacklist=$cur $ip"
+		uci commit wol_autowake
+		/etc/init.d/wol-autowake restart >/dev/null 2>&1
+		emit true "已把 $ip 加入黑名单并重启服务"
+		;;
+
+	unblock:*)
+		ip=${q#unblock:}
+		[ -n "$ip" ] || { emit false "缺少 IP"; exit 0; }
+		cur=$(uci -q get wol_autowake.settings.blacklist)
+		new=$(printf '%s' "$cur" | tr ' ,;' '\n\n\n' | grep -vxF "$ip" | tr '\n' ' ')
+		uci set "wol_autowake.settings.blacklist=$new"
+		uci commit wol_autowake
+		/etc/init.d/wol-autowake restart >/dev/null 2>&1
+		emit true "已把 $ip 从黑名单移除并重启服务"
+		;;
+
+	# ---- 设置某台设备的「启用转发」并立刻生效 ----
+	setfw:*)
+		arg=${q#setfw:}
+		want=${arg%:*}
+		val=${arg##*:}
+
+		case "$val" in
+			0|1) ;;
+			*) emit false "参数必须是 0 或 1（收到：$val）"; exit 0 ;;
+		esac
+		[ -n "$want" ] || { emit false "缺少设备标识"; exit 0; }
+
+		find_section "$want"
+		[ -n "$FS_FOUND" ] || { emit false "没找到设备：$want"; exit 0; }
+
+		uci set "wol_autowake.$FS_FOUND.fw_enabled=$val"
+		uci commit wol_autowake
+
+		# ★ 关键：重新加载配置，否则 sync_all 读到的是旧值（同 setv6）
+		config_load wol_autowake
+		sync_all
+
+		if [ "$val" = "1" ]; then
+			emit true "已启用转发（$want）：规则生效，端口对外开放"
+		else
+			emit true "已停用转发（$want）：规则保留但保持停用，端口不对外开放"
+		fi
+		;;
+
+	# ---- 设置某台设备的「IPv6 放行」并立刻生效 ----
+	setv6:*)
+		arg=${q#setv6:}
+		want=${arg%:*}
+		val=${arg##*:}
+
+		case "$val" in
+			0|1) ;;
+			*) emit false "参数必须是 0 或 1（收到：$val）"; exit 0 ;;
+		esac
+		[ -n "$want" ] || { emit false "缺少设备标识"; exit 0; }
+
+		find_section "$want"
+		[ -n "$FS_FOUND" ] || { emit false "没找到设备：$want"; exit 0; }
+
+		uci set "wol_autowake.$FS_FOUND.ipv6_allow=$val"
+		uci commit wol_autowake
+
+		# ★ 关键：重新加载配置，否则下面的 sync_all 读到的还是旧值
+		#   （config_get 是读内存里的配置，uci set 不会自动刷新）
+		config_load wol_autowake
+		sync_all
+
+		if [ "$val" = "1" ]; then
+			emit true "已开启 IPv6 放行（$want）"
+		else
+			emit true "已关闭 IPv6 放行（$want）：规则已移除，IPv6 不再可达"
+		fi
+		;;
+
+	# ---- 把设备配置同步到防火墙设置 ----
+	sync)
+		sync_all
+		if [ "$SYNC_N" = "0" ]; then
+			emit true "没有需要同步的设备（规则需要设备同时填了「外部端口」和「内网 IP」）"
+		else
+			emit true "已同步 $SYNC_N 台设备：新建规则 $SYNC_CREATED 条；启用 $SYNC_ON 条 / 停用 $SYNC_OFF 条；日志已开 $SYNC_LOGFIX 条$([ "$SYNC_SKIP" -gt 0 ] && echo "；跳过 $SYNC_SKIP 台（缺 IP 或端口）")"
+		fi
+		;;
+
+	"")
+		emit false "缺少 q 参数"
+		;;
+
+	*)
+		emit false "未知动作：$q"
+		;;
+esac
+exit 0
