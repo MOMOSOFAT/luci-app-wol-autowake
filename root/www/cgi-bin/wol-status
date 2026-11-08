@@ -1,0 +1,30 @@
+#!/bin/sh
+# ==============================================================================
+# wol-status (CGI) -- 给 LuCI 页面读状态
+#   GET /cgi-bin/wol-status        -> JSON
+# 由 uhttpd 直接执行，不走 ubus/rpcd，所以不依赖 rpcd-mod-file
+# ==============================================================================
+
+echo "Content-Type: application/json"
+echo "Cache-Control: no-store"
+echo ""
+
+# 只允许内网 / Tailscale 来源访问（防止哪天 LuCI 暴露到公网时泄露信息）
+case "${REMOTE_ADDR:-}" in
+	127.*|::1|10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*|100.*|fd*|fe80*) ;;
+	*) printf '{"error":"forbidden"}\n'; exit 0 ;;
+esac
+
+out=$(/usr/bin/wol-status 2>&1)
+
+case "$out" in
+	\{*)
+		printf '%s\n' "$out"
+		;;
+	*)
+		# 把脚本真实报错暴露给前端，方便排查
+		err=$(printf '%s' "$out" | head -c 400 | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr '\n' ' ')
+		printf '{"error":"wol-status 执行异常: %s"}\n' "$err"
+		;;
+esac
+exit 0
