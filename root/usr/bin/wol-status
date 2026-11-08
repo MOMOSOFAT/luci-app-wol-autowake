@@ -1,0 +1,227 @@
+#!/bin/sh
+# ==============================================================================
+# wol-status  --  输出 JSON 状态，供 LuCI 页面读取
+#
+# 输出字段:
+#   running / etherwake / config_ok / iface / throttle / logread
+#   filter{}: on 忽略国外 / src 数据源 / cn 国内IP条数 / cn_ok 就绪
+#             bl 黑名单条数 / ipv6 忽略IPv6 / ign 今日忽略 / woke 今日唤醒
+#   devices[]:
+#     sec name mac ip port dest_port proto enabled online
+#     fw_on        -- 设备配置的"启用转发"开关（1=规则生效）
+#     fw_exists    -- 对应的端口转发规则是否存在
+#     fw_enabled   -- 该规则是否真的启用
+#     fw_log       -- 该规则是否开了日志（自动唤醒的触发来源）
+#     fw_name      -- 规则名
+#   log:  最近唤醒记录（优先读 /root/wol-autowake.log）
+#   seen: 可疑来源 IP 列表（从日志里提取，带次数/设备/归属/是否已拉黑）
+#
+# 性能相关的设计（页面"打开慢"就靠这一条）:
+#   本脚本【绝不 ping】—— 在线状态由 wol-online-scan 在后台定时扫好（守护进程每 10 秒
+#   一次，cron 每分钟兜底），这里只读 /tmp/wol-online.list。
+#   以前是 CGI 自己 ping：离线设备每次都要等满 -W 1 超时 -> 每个请求卡 1 秒，
+#   还会把 uhttpd 的其他请求一起堵住，整个页面都卡。
+#   ⚠️ 唤醒判断不受影响 —— wol-autowake.sh 每次仍然实时 ping。
+#   另外 fw_sections() 对防火墙配置只 dump 一次（见 wol-fw.sh 的缓存）。
+#
+# 设备名允许含空格 -> 用 config_foreach 遍历，不做字符串拆分
+# ==============================================================================
+
+. /lib/functions.sh
+. /usr/libexec/wol-fw.sh
+
+jesc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\t/ /g'; }
+b()    { [ "$1" = "1" ] && echo true || echo false; }
+
+config_load wol_autowake
+config_get IFACE settings iface "br-lan"
+config_get THROTTLE settings throttle "60"
+config_get_bool LOGREAD settings logread 1
+
+running=false
+pgrep -f '[w]ol-autowake.sh' >/dev/null 2>&1 && running=true
+
+tool=false
+command -v etherwake >/dev/null 2>&1 && tool=true
+
+cfgok=false
+[ -f /etc/config/wol_autowake ] && cfgok=true
+
+# ------------------------------------------------------------------ 在线状态
+# 【本脚本绝不 ping】
+#   在线状态由后台的 wol-online-scan 定时扫好写进文件（守护进程每 10 秒一次，
+#   cron 每分钟兜底一次），这里只读文件。
+#   这样每次请求都是毫秒级，也不会卡住 uhttpd 的其他请求。
+#   ⚠️ 唤醒判断不受影响 —— wol-autowake.sh 每次仍然实时 ping。
+CACHE_ONLINE="/tmp/wol-online.list"     # 每行一个"在线"的 IP
+
+# 来源过滤的状态（给界面状态卡片用）
+_IGN=$(uci -q get wol_autowake.settings.ignore_foreign 2>/dev/null)
+_SRC=$(uci -q get wol_autowake.settings.cn_source 2>/dev/null)
+_IV6=$(uci -q get wol_autowake.settings.ignore_ipv6 2>/dev/null)
+case "$_IGN" in 1) IGN_B=1 ;; *) IGN_B=0 ;; esac
+case "$_IV6" in 0) IV6_B=0 ;; *) IV6_B=1 ;; esac
+case "$_SRC" in download) SRC_NAME=download ;; *) SRC_NAME=openclash ;; esac
+CN_CNT=$(ipset list wol_cn4 2>/dev/null | sed -n 's/^Number of entries: //p')
+CN_CNT=${CN_CNT:-0}
+BL_CNT=$(ipset list wol_bl4 2>/dev/null | sed -n 's/^Number of entries: //p')
+BL_CNT=${BL_CNT:-0}
+# 集合是否就绪
+if [ "$CN_CNT" -gt 0 ] 2>/dev/null; then CN_OK=1; else CN_OK=0; fi
+# 今日统计
+_TODAY=$(date '+%Y-%m-%d' 2>/dev/null)
+[ -n "$_TODAY" ] || _TODAY=$(date '+%Y-%m-%d')
+# 必须精确匹配 " 忽略 [" / " 唤醒 [" ——
+# 忽略行里含"不唤醒"三个字，用 ".*唤醒" 会把忽略行也算成唤醒（之前就这样算错了）
+IGN_TODAY=$(grep -c "^$_TODAY .*忽略 \[" /root/wol-autowake.log 2>/dev/null || true)
+WOKE_TODAY=$(grep -c "^$_TODAY .*唤醒 \[" /root/wol-autowake.log 2>/dev/null || true)
+IGN_TODAY=${IGN_TODAY:-0}
+WOKE_TODAY=${WOKE_TODAY:-0}
+
+# ------------------------------------------------------------------ 输出
+printf '{"running":%s,"etherwake":%s,"config_ok":%s,"iface":"%s","throttle":"%s","logread":%s,"filter":{"on":%s,"src":"%s","cn":%s,"cn_ok":%s,"bl":%s,"ipv6":%s,"ign":%s,"woke":%s},"devices":[' \
+	"$running" "$tool" "$cfgok" "$(jesc "$IFACE")" "$(jesc "$THROTTLE")" "$(b "$LOGREAD")" \
+	"$(b "$IGN_B")" "$SRC_NAME" "$CN_CNT" "$(b "$CN_OK")" "$BL_CNT" "$(b "$IV6_B")" "$IGN_TODAY" "$WOKE_TODAY"
+
+FIRST=1
+emit_dev() {
+	local s="$1" name port mac ip en dport proto
+	local online fsec f6sec fw_exists fw_enabled fw_log fw_name fw6_exists fw6_enabled
+
+	config_get name  "$s" name
+	config_get port  "$s" port
+	config_get mac   "$s" mac
+	config_get ip    "$s" ip
+	config_get dport "$s" dest_port
+	config_get proto "$s" proto
+	config_get_bool en  "$s" enabled 1
+	config_get_bool fwon "$s" fw_enabled 0
+
+	# 内网端口留空 -> 默认 3389（与 wol-fw.sh / wol-ctl 保持一致）
+	[ -n "$dport" ] || dport=3389
+	[ -n "$proto" ] || proto="tcp"
+
+	# 在线状态：查上面那份清单（并行探测 + 缓存的结果）
+	online=false
+	if [ -n "$ip" ] && grep -qxF "$ip" "$CACHE_ONLINE" 2>/dev/null; then
+		online=true
+	fi
+
+	# 查对应的端口转发规则
+	fw_exists=false; fw_enabled=false; fw_log=false; fw_name=""
+	fsec=$(fw_find_by_port "$port")
+	if [ -n "$fsec" ]; then
+		fw_exists=true
+		fw_is_enabled "$fsec" && fw_enabled=true
+		fw_has_log "$fsec" && fw_log=true
+		fw_name=$(uci get "firewall.$fsec.name" 2>/dev/null)
+	fi
+
+	# IPv6 放行规则（WOLAUTO-<端口>-V6）
+	fw6_exists=false; fw6_enabled=false
+	f6sec=$(fw_find6_by_port "$port")
+	if [ -n "$f6sec" ]; then
+		fw6_exists=true
+		fw_is_enabled "$f6sec" && fw6_enabled=true
+	fi
+
+	[ "$FIRST" = "1" ] || printf ','
+	FIRST=0
+	printf '{"sec":"%s",' "$(jesc "$s")"
+	printf '"name":"%s","mac":"%s","ip":"%s","port":"%s","dest_port":"%s","proto":"%s",' \
+		"$(jesc "${name:-$mac}")" "$(jesc "$mac")" "$(jesc "$ip")" \
+		"$(jesc "$port")" "$(jesc "$dport")" "$(jesc "$proto")"
+	printf '"enabled":%s,"online":%s,"fw_on":%s,' \
+		"$(b "$en")" "$online" "$(b "$fwon")"
+	printf '"fw_exists":%s,"fw_enabled":%s,"fw_log":%s,"fw_name":"%s",' \
+		"$fw_exists" "$fw_enabled" "$fw_log" "$(jesc "$fw_name")"
+	printf '"fw6_exists":%s,"fw6_enabled":%s}' \
+		"$fw6_exists" "$fw6_enabled"
+}
+config_foreach emit_dev device
+printf ']'
+
+# 最近唤醒记录：优先读持久日志（/root/wol-autowake.log，重启不丢），
+# 没有就退回系统日志（会被环形缓冲挤掉，但聊胜于无）
+if [ -s /root/wol-autowake.log ]; then
+	logsrc=$(tail -n 40 /root/wol-autowake.log 2>/dev/null)
+else
+	logsrc=$(logread 2>/dev/null | grep -iE 'wol-autowake|wol-wake' | tail -n 40)
+fi
+
+logtxt=$(printf '%s\n' "$logsrc" \
+	| sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\t/ /g' \
+	| awk 'BEGIN{ORS="\\n"} {print}')
+
+# ------------------------------------------------------------------ 可疑来源
+# 从持久日志里提取所有出现过的 来源=<ip>，聚合成列表：
+#   ip | 次数 | 最近时间 | 设备 | 是否国内 | 是否已在黑名单 | 最后一次是唤醒还是忽略
+SEEN_JSON=""
+LOGF=/root/wol-autowake.log
+if [ -s "$LOGF" ]; then
+	# 用 sed 先把每行规整成: 时间戳|来源IP|设备|结果
+	#   （不能用 awk 的 index()/substr() 定位 "来源=" —— 那是字节偏移，
+	#     而中文是多字节，会多跳一个字节，把 IP 的第一位吃掉）
+	# 输出按【最近时间倒序】：把时间戳放第一列，用最朴素的 sort -r，
+	# 避开 BusyBox sort 对 -k/-t 修饰符支持不全的坑。
+	AGG=$(tail -n 400 "$LOGF" 2>/dev/null \
+		| sed -n 's/^\([0-9][0-9-]* [0-9:]*\)  \(忽略\|唤醒\) \[\([^]]*\)\].*来源=\([0-9a-fA-F.:]*\).*/\1|\4|\3|\2/p' \
+		| awk -F'|' '{
+			cnt[$2]++; last[$2] = $1; devs[$2] = $3; kinds[$2] = $4
+		}
+		END {
+			for (k in cnt) printf "%s|%s|%d|%s|%s\n", last[k], k, cnt[k], devs[k], kinds[k]
+		}' | sort -r)
+
+	SEEN_JSON=$(printf '%s\n' "$AGG" | while IFS='|' read -r ts ip n dev kind; do
+		[ -n "$ip" ] || continue
+
+		# 内网 / 回环地址不是"可疑来源"，直接跳过（自己家的设备）
+		case "$ip" in
+			10.*|192.168.*|127.*) continue ;;
+			172.1[6-9].*|172.2[0-9].*|172.3[01].*) continue ;;
+			fc*|fd*|fe8*|fe9*|fea*|feb*) continue ;;
+		esac
+
+		cn=false; bl=false
+		is6=false
+		case "$ip" in
+			*:*) is6=true ;;
+		esac
+		if [ "$is6" = "true" ]; then
+			ipset test wol_cn6 "$ip" >/dev/null 2>&1 && cn=true
+		else
+			ipset test wol_cn4 "$ip" >/dev/null 2>&1 && cn=true
+		fi
+		ipset test wol_bl4 "$ip" >/dev/null 2>&1 && bl=true
+		# 筛选规则：国外来源一律列出；国内来源只列"次数 >= 3"的（偶发访问的多半是误报）
+		if [ "$cn" = "true" ] && [ "${n:-0}" -lt 3 ] 2>/dev/null; then
+			continue
+		fi
+		printf '{"ip":"%s","n":%s,"last":"%s","dev":"%s","kind":"%s","cn":%s,"bl":%s},' \
+			"$(jesc "$ip")" "${n:-0}" "$(jesc "$ts")" "$(jesc "$dev")" "$(jesc "$kind")" "$cn" "$bl"
+	done | head -n 50)
+fi
+
+# ------------------------------------------------------------------ 最近 10 条唤醒/忽略记录
+#   无论是否真的唤醒了，都列出来（唤醒 + 忽略），格式与"可疑 IP"一致
+EVENTS_JSON=""
+if [ -s "$LOGF" ]; then
+	EV=$( { tail -n 400 "$LOGF" 2>/dev/null \
+			| sed -n 's/^\([0-9][0-9-]* [0-9:]*\)  唤醒 \[\([^]]*\)\].*端口=\([0-9][0-9]*\) .*来源=\([0-9a-fA-F.:]*\).*/\1|唤醒|\2|\3|\4|已发魔术包/p'
+		tail -n 400 "$LOGF" 2>/dev/null \
+			| sed -n 's/^\([0-9][0-9-]* [0-9:]*\)  忽略 \[\([^]]*\)\] 来源=\([0-9a-fA-F.:]*\)（\(.*\)）$/\1|忽略|\2|-|\3|\4/p'
+	      } | sort -r | head -n 10)
+
+	EVENTS_JSON=$(printf '%s\n' "$EV" | while IFS='|' read -r ts kind dev port ip why; do
+		[ -n "$ts" ] || continue
+		printf '{"ts":"%s","kind":"%s","dev":"%s","port":"%s","ip":"%s","why":"%s"},' \
+			"$(jesc "$ts")" "$(jesc "$kind")" "$(jesc "$dev")" \
+			"$(jesc "$port")" "$(jesc "$ip")" "$(jesc "$why")"
+	done)
+fi
+
+printf ',"log":"%s"' "$logtxt"
+printf ',"seen":[%s]' "${SEEN_JSON%,}"
+printf ',"events":[%s]}\n' "${EVENTS_JSON%,}"
+exit 0
