@@ -1,0 +1,71 @@
+#!/bin/sh
+# ==============================================================================
+#  wol-logclean  --  定期清理系统日志
+#
+#  为什么要它:
+#    自动唤醒靠"防火墙日志里出现 DPT=<端口>"触发，所以转发规则必须开日志。
+#    而防火墙日志是写进【系统日志】的（logd 的环形缓冲 / 可选的日志文件），
+#    应用没法只清掉自己那部分 —— 所以这里做整体兜底清理。
+#
+#  两层防护:
+#    1) 源头控量：规则上的 log_limit = 2/minute（见 wol-fw.sh 的 FW_LOGLIMIT）
+#       应用每台设备 60 秒才唤醒一次，2/分钟完全够用
+#    2) 定期兜底：本脚本（默认每 6 小时检查一次）
+#         · 如果系统日志写文件  → 超过阈值就截断（保护 flash）
+#         · 如果是内存环形缓冲  → 超过阈值就重启 logd 清空
+#
+#  ⚠️ 注意: 清理是【整体】的 —— 会连其他服务的日志一起清掉。
+#     阈值默认 256KB，OpenWrt 默认环形缓冲只有 64KB，所以正常情况下几乎不会触发，
+#     它更像是"日志失控时的保险丝"。
+#
+#  配置: /etc/config/wol_autowake 的 settings 段
+#     option logclean_enabled '1'      # 总开关
+#     option logclean_interval '6'     # 检查间隔（小时）
+#     option logclean_maxkb '256'      # 阈值（KB）
+#
+#  由 cron 每小时调用一次，脚本内部自己判断间隔是否到了。
+# ==============================================================================
+
+. /lib/functions.sh
+
+config_load wol_autowake
+config_get_bool ENABLED  settings logclean_enabled 1
+config_get      INTERVAL settings logclean_interval 6
+config_get      MAXKB    settings logclean_maxkb 256
+
+[ "$ENABLED" = "1" ] || exit 0
+
+case "$INTERVAL" in ''|*[!0-9]*) INTERVAL=6 ;; esac
+case "$MAXKB"    in ''|*[!0-9]*) MAXKB=256 ;; esac
+[ "$INTERVAL" -lt 1 ] && INTERVAL=1
+
+# ---- 间隔节流（状态放 /tmp，重启后重算，可接受）----
+STATE="/tmp/wol-logclean.ts"
+NOW=$(date +%s)
+LAST=$(cat "$STATE" 2>/dev/null || echo 0)
+case "$LAST" in ''|*[!0-9]*) LAST=0 ;; esac
+[ $((NOW - LAST)) -lt $((INTERVAL * 3600)) ] && exit 0
+echo "$NOW" > "$STATE"
+
+MAXBYTES=$((MAXKB * 1024))
+
+# ---- 情况 1: 系统日志写文件 → 截断 ----
+LOGFILE=$(uci get system.@system[0].log_file 2>/dev/null)
+if [ -n "$LOGFILE" ] && [ -f "$LOGFILE" ]; then
+	SIZE=$(wc -c < "$LOGFILE" 2>/dev/null || echo 0)
+	if [ "$SIZE" -gt "$MAXBYTES" ]; then
+		: > "$LOGFILE"
+		logger -t wol-logclean "系统日志文件超过 ${MAXKB}KB，已截断: $LOGFILE"
+	fi
+	exit 0
+fi
+
+# ---- 情况 2: 内存环形缓冲 → 重启 logd 清空 ----
+SIZE=$(logread 2>/dev/null | wc -c)
+case "$SIZE" in ''|*[!0-9]*) SIZE=0 ;; esac
+if [ "$SIZE" -gt "$MAXBYTES" ]; then
+	/etc/init.d/log restart >/dev/null 2>&1
+	logger -t wol-logclean "系统日志缓冲超过 ${MAXKB}KB，已重启 logd 清空"
+fi
+
+exit 0
