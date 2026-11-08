@@ -1,0 +1,95 @@
+#!/bin/sh /etc/rc.common
+# luci-app-wol-autowake : 远程连接自动唤醒服务
+START=99
+STOP=10
+USE_PROCD=1
+
+CRON_TAG_BEGIN="# WOLAUTO-APP -- 由 luci-app-wol-autowake 管理，请勿手改下面几行"
+CRON_TAG_END="# WOLAUTO-APP-END"
+
+# 把本应用的 cron 行整体重写进标记块（幂等；卸载时整块删掉）
+sync_cron() {
+	local f=/etc/crontabs/root
+	local tmp="/tmp/wol-cron.$$"
+	local keep_cn keep_scan keep_clean
+
+	config_load wol_autowake
+	config_get_bool keep_cn   settings ignore_foreign 0
+	config_get_bool keep_scan settings scan_online_every 6
+	config_get_bool keep_clean settings logclean_enabled 1
+
+	[ -f "$f" ] || : > "$f"
+
+	# 先剥掉新的标记块、旧版的 WOLAUTO-LOGCLEAN 块，以及旧版散落的 wol-cnlist 行
+	sed -e "/^$CRON_TAG_BEGIN\$/,/^$CRON_TAG_END\$/d" \
+	    -e '/^# WOLAUTO-LOGCLEAN --/,/^# WOLAUTO-END\$/d' \
+	    -e '/wol-cnlist/d' \
+	    -e '/wol-online-scan/d' \
+	    -e '/wol-logclean/d' "$f" > "$tmp" 2>/dev/null || cp "$f" "$tmp"
+
+	# 去掉尾部空行
+	sed -i -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$tmp" 2>/dev/null
+
+	{
+		cat "$tmp"
+		echo ""
+		echo "$CRON_TAG_BEGIN"
+		[ "$keep_cn" = "1" ] && echo "20 4 * * 1 /usr/bin/wol-cnlist ensure >/dev/null 2>&1"
+		[ "$keep_scan" != "0" ] && echo "* * * * * /usr/bin/wol-online-scan >/dev/null 2>&1"
+		[ "$keep_clean" = "1" ] && echo "17 * * * * /usr/bin/wol-logclean >/dev/null 2>&1"
+		echo "$CRON_TAG_END"
+	} > "$f" 2>/dev/null
+
+	rm -f "$tmp"
+	/etc/init.d/cron restart >/dev/null 2>&1
+}
+
+start_service() {
+	local enabled if_
+	config_load wol_autowake
+	config_get_bool enabled settings enabled 1
+	[ "$enabled" = "1" ] || {
+		logger -t wol-autowake "配置中已禁用，不启动"
+		return 0
+	}
+
+	# 国内 IP 表：ipset 不跨重启，而且要跟随 OpenClash 的数据文件更新。
+	# 注意：只用 OpenClash 的【数据文件】，不依赖 OpenClash 是否在运行。
+	config_get_bool if_ settings ignore_foreign 0
+	if [ "$if_" = "1" ] && [ -x /usr/bin/wol-cnlist ]; then
+		/usr/bin/wol-cnlist ensure >/dev/null 2>&1
+	fi
+
+	# cron 行统一进标记块（含国内的每周重建）
+	sync_cron
+
+	# 「内网走公网也能触发唤醒」的 nft 规则
+	if [ -f /usr/libexec/wol-fw.sh ]; then
+		. /usr/libexec/wol-fw.sh
+		local hp
+		config_get_bool hp settings wake_hairpin 0
+		fw_hairpin "$hp" >/dev/null 2>&1
+	fi
+
+	procd_open_instance
+	procd_set_param command /usr/libexec/wol-autowake.sh
+	procd_set_param respawn 3600 5 5
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+service_triggers() {
+	procd_add_reload_trigger "wol_autowake"
+}
+
+reload_service() {
+	stop
+	start
+}
+
+stop_service() {
+	# 停止服务时【不删】规则和 cron —— 正常使用场景下停一下还会再起。
+	# 彻底卸载由 postrm 负责清理。
+	return 0
+}
