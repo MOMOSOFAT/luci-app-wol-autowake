@@ -1,0 +1,205 @@
+#!/bin/sh
+# ==============================================================================
+# wol-cnlist  --  维护"中国大陆 IP 段"集合（IPv4 + IPv6 双表）
+#
+#   wol-cnlist build     强制重建（按配置的数据源重新取，再灌进 ipset）
+#   wol-cnlist ensure    按需重建：集合不存在、或数据源变新了，才动手
+#   wol-cnlist status    显示状态
+#   wol-cnlist test <ip> 测试某个 IP 是否在中国大陆（自动区分 v4/v6）
+#
+# 生成两个 ipset：
+#   wol_cn4  family inet   来自 china_ip_route.ipset   / all_cn.txt
+#   wol_cn6  family inet6  来自 china_ip6_route.ipset  / all_cn_ipv6.txt
+#
+# 数据源由 UCI 决定：wol_autowake.settings.cn_source
+#   openclash （默认）优先用 OpenClash 的数据文件，失败则退回下载
+#   download          优先自己下载，失败则退回用 OpenClash 的数据文件
+#
+# ★ 重要：不管哪种模式，都不使用 OpenClash 的 nft 集合 ——
+#   那个集合只在 OpenClash 运行时存在。本脚本只「参考它的数据文件」，
+#   把 CIDR 灌进自己的 ipset，所以 OpenClash 开着 / 关着 / 甚至卸载，
+#   本功能都照常工作。
+#
+# ipset 不随 fw4 reload 消失，但重启会丢 —— 开机由 init 脚本 ensure 一次。
+# ==============================================================================
+
+DIR="/etc/wol-autowake"
+STAMP="$DIR/stamp"
+OC4="/etc/openclash/china_ip_route.ipset"
+OC6="/etc/openclash/china_ip6_route.ipset"
+DL4="https://ispip.clang.cn/all_cn.txt"
+DL6="https://ispip.clang.cn/all_cn_ipv6.txt"
+SET4="wol_cn4"
+SET6="wol_cn6"
+
+set_exists() { ipset list -n 2>/dev/null | grep -qx "$1"; }
+
+cn_source() {
+	local v
+	v=$(uci -q get wol_autowake.settings.cn_source 2>/dev/null)
+	case "$v" in
+		download) echo download ;;
+		*)        echo openclash ;;
+	esac
+}
+
+# 从 OpenClash 的 nft 定义文件里提取 CIDR
+#   $1=源文件  $2=输出文件  $3=v4|v6
+extract_oc() {
+	local src="$1" out="$2" fam="$3"
+	[ -s "$src" ] || return 1
+	case "$fam" in
+		v4) sed -n 's/^[[:space:]]*\([0-9][0-9.]*\/[0-9][0-9]*\),[[:space:]]*$/\1/p' "$src" > "$out.tmp" ;;
+		v6) sed -n 's/^[[:space:]]*\([0-9a-fA-F:][0-9a-fA-F:]*\/[0-9][0-9]*\),[[:space:]]*$/\1/p' "$src" > "$out.tmp" ;;
+	esac
+	[ -s "$out.tmp" ] || { rm -f "$out.tmp"; return 1; }
+	mv "$out.tmp" "$out"
+	return 0
+}
+
+download_to() {
+	local url="$1" out="$2" min="${3:-1000}"
+	command -v curl >/dev/null 2>&1 || return 1
+	curl -fsSL --max-time 40 "$url" -o "$out.tmp" 2>/dev/null || {
+		rm -f "$out.tmp"; return 1; }
+	[ "$(grep -cE '^[0-9a-fA-F:]' "$out.tmp" 2>/dev/null || echo 0)" -ge "$min" ] || {
+		rm -f "$out.tmp"; return 1; }
+	mv "$out.tmp" "$out"
+	return 0
+}
+
+# 按配置取数据（带双向兜底）；$1=v4|v6
+fill_list() {
+	local fam="$1" src out dl min
+	case "$fam" in
+		v4) src="$OC4"; out="$DIR/cn_ipv4.txt"; dl="$DL4"; min=1000 ;;
+		v6) src="$OC6"; out="$DIR/cn_ipv6.txt"; dl="$DL6"; min=500  ;;
+	esac
+
+	case "$(cn_source)" in
+		download)
+			download_to "$dl" "$out" "$min" && return 0
+			extract_oc "$src" "$out" "$fam" && return 0
+			;;
+		*)
+			extract_oc "$src" "$out" "$fam" && return 0
+			download_to "$dl" "$out" "$min" && return 0
+			;;
+	esac
+	return 1
+}
+
+# 建一个集合；$1=集合名 $2=ipset family $3=数据文件
+build_set() {
+	local name="$1" fam="$2" file="$3" n cnt
+	if [ ! -s "$file" ]; then
+		echo "  $name: 无数据，跳过"
+		return 1
+	fi
+	n=$(grep -cE '^[0-9a-fA-F:]' "$file" 2>/dev/null || echo 0)
+	ipset destroy "$name" 2>/dev/null
+	ipset create "$name" hash:net family "$fam" hashsize 2048 maxelem 262144 2>/dev/null || {
+		echo "  $name: 创建失败"; return 1; }
+	grep -E '^[0-9a-fA-F:]' "$file" | sed 's/[[:space:]]//g' \
+		| sed "s/^/add $name /" > "/tmp/wol-$name.restore" 2>/dev/null
+	ipset restore -exist < "/tmp/wol-$name.restore" 2>/dev/null
+	rm -f "/tmp/wol-$name.restore"
+	cnt=$(ipset list "$name" 2>/dev/null | sed -n 's/^Number of entries: //p')
+	echo "  $name: ${cnt:-0} 条（文件 $n 行）"
+	[ "${cnt:-0}" -gt 0 ] 2>/dev/null
+}
+
+do_build() {
+	mkdir -p "$DIR" 2>/dev/null
+	command -v ipset >/dev/null 2>&1 || { echo "错误: 系统没有 ipset 命令"; return 1; }
+
+	local mode ok4=0 ok6=0
+	mode=$(cn_source)
+	echo "数据源模式: $mode"
+
+	fill_list v4 && ok4=1
+	fill_list v6 && ok6=1
+
+	if [ "$ok4" = "0" ] && [ -s "$DIR/cn_ipv4.txt" ]; then ok4=1; fi
+	if [ "$ok6" = "0" ] && [ -s "$DIR/cn_ipv6.txt" ]; then ok6=1; fi
+
+	[ "$ok4" = "1" ] || echo "警告: 拿不到 IPv4 数据（本地也没有缓存）"
+	[ "$ok6" = "1" ] || echo "警告: 拿不到 IPv6 数据（本地也没有缓存）"
+
+	build_set "$SET4" inet  "$DIR/cn_ipv4.txt"
+	build_set "$SET6" inet6 "$DIR/cn_ipv6.txt"
+
+	date '+%Y-%m-%d %H:%M:%S' > "$STAMP" 2>/dev/null
+	return 0
+}
+
+do_ensure() {
+	local need=0
+	set_exists "$SET4" || need=1
+	set_exists "$SET6" || need=1
+
+	if [ "$need" = "0" ]; then
+		case "$(cn_source)" in
+			download)
+				if [ -f "$STAMP" ]; then
+					local age
+					age=$(( $(date +%s) - $(date -r "$STAMP" +%s 2>/dev/null || echo 0) ))
+					[ "$age" -gt 604800 ] && need=1
+				else
+					need=1
+				fi
+				;;
+			*)
+				if [ -f "$STAMP" ]; then
+					if [ -s "$OC4" ] && [ "$OC4" -nt "$STAMP" ]; then need=1; fi
+					if [ -s "$OC6" ] && [ "$OC6" -nt "$STAMP" ]; then need=1; fi
+				else
+					need=1
+				fi
+				;;
+		esac
+	fi
+
+	[ "$need" = "1" ] || return 0
+	do_build >/dev/null 2>&1
+}
+
+do_status() {
+	echo "数据来源  : $(cn_source)"
+	echo "上次构建  : $(cat "$STAMP" 2>/dev/null || echo '从未')"
+	local s
+	for s in "$SET4" "$SET6"; do
+		if set_exists "$s"; then
+			echo "$s : $(ipset list "$s" 2>/dev/null | sed -n 's/^Number of entries: //p') 条"
+		else
+			echo "$s : 不存在"
+		fi
+	done
+	echo "IPv4 文件 : $DIR/cn_ipv4.txt $([ -s "$DIR/cn_ipv4.txt" ] && echo "($(grep -cE '^[0-9]' "$DIR/cn_ipv4.txt") 行)" || echo '(无)')"
+	echo "IPv6 文件 : $DIR/cn_ipv6.txt $([ -s "$DIR/cn_ipv6.txt" ] && echo "($(grep -cE '^[0-9a-fA-F:]' "$DIR/cn_ipv6.txt") 行)" || echo '(无)')"
+	[ -s "$OC4" ] && echo "OpenClash : v4 数据文件在" || echo "OpenClash : v4 数据文件缺"
+	[ -s "$OC6" ] && echo "OpenClash : v6 数据文件在" || echo "OpenClash : v6 数据文件缺"
+	echo ""
+	echo "说明: 只读取 OpenClash 的数据文件，不依赖 OpenClash 是否在运行"
+}
+
+case "$1" in
+	build)  do_build ;;
+	ensure) do_ensure ;;
+	status) do_status ;;
+	test)
+		[ -n "$2" ] || { echo "用法: wol-cnlist test <ip>"; exit 1; }
+		case "$2" in
+			*:*) if set_exists "$SET6" && ipset test "$SET6" "$2" >/dev/null 2>&1; then
+					echo "$2 在中国大陆（IPv6 表）"; exit 0; fi ;;
+			*)   if set_exists "$SET4" && ipset test "$SET4" "$2" >/dev/null 2>&1; then
+					echo "$2 在中国大陆（IPv4 表）"; exit 0; fi ;;
+		esac
+		echo "$2 不在中国大陆（或对应集合不存在）"
+		exit 1
+		;;
+	*)
+		echo "用法: wol-cnlist {build|ensure|status|test <ip>}"
+		exit 1
+		;;
+esac
