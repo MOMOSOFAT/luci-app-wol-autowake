@@ -380,8 +380,6 @@ Copyright (c) 2026 MOMOSOFAT <msrjcl@163.com>
 Licensed under the Apache License, Version 2.0
 ```
 
-三行就够，既符合许可要求，也方便别人追溯来源。
-
 ---
 
 ## 联系方式
