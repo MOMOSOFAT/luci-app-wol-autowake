@@ -1,0 +1,11 @@
+{
+	"admin/services/wol-autowake": {
+		"title": "自动唤醒",
+		"order": 61,
+		"action": { "type": "view", "path": "wol-autowake/main" },
+		"depends": {
+			"acl": [ "luci-app-wol-autowake" ],
+			"fs": { "/etc/config/wol_autowake": "file" }
+		}
+	}
+}
