@@ -284,6 +284,107 @@ Restart-Service TermService -Force
 
 ---
 
+## 用远程桌面的话，这几件事也要做
+
+插件负责「叫醒电脑」，能不能连上还要看电脑这边的远程桌面有没有配好。
+
+### ① 打开「允许远程连接」
+
+```
+设置 → 系统 → 远程桌面 → 打开「远程桌面」
+```
+
+或者旧版路径：
+
+```
+控制面板 → 系统 → 远程设置 → 允许远程连接到此计算机
+```
+
+### ② 确认这三个服务是运行状态
+
+`Win + R` 输入 `services.msc`，找到并检查：
+
+| 服务名 | 显示名称 | 启动类型 | 状态 |
+|---|---|---|---|
+| **TermService** | Remote Desktop Services | **自动** | **正在运行** |
+| **UmRdpService** | Remote Desktop Services UserMode Port Redirector | 手动 | 运行（有连接时会自动起） |
+| **SessionEnv** | Remote Desktop Configuration | 手动 | 运行 |
+
+**命令方式检查**（管理员 PowerShell）：
+
+```powershell
+Get-Service TermService, UmRdpService, SessionEnv | Format-Table Name, Status, StartType
+```
+
+**如果不是「自动 / 运行」，改成自动并启动**：
+
+```powershell
+Set-Service TermService -StartupType Automatic
+Start-Service TermService
+```
+
+> 注意：远程桌面服务**被停掉或禁用了，端口开着也连不上** —— 现象是「连接被拒绝」
+> 而不是「超时」，这个和唤醒失败的症状不一样，别搞混。
+
+### ③ 防火墙放行
+
+Windows 防火墙里确认这条**入站规则**是启用的：
+
+```
+远程桌面 - 用户模式(TCP-In)
+远程桌面 - 用户模式(UDP-In)
+```
+
+**如果你改过端口**（比如改成 21389），上面两条规则就不匹配了，要手动加：
+
+```powershell
+New-NetFirewallRule -DisplayName "RDP 21389" -Direction Inbound -Protocol TCP -LocalPort 21389 -Action Allow
+```
+
+### ④ 账户必须有密码
+
+**空密码的账户不能用于远程桌面** —— Windows 安全策略禁止。
+
+### ⑤ 微软账户：改过密码要重新登录一次
+
+**这一条很坑，单独说。**
+
+如果这台电脑是**用微软账户登录**的（`MicrosoftAccount\你的邮箱`），
+而你在手机或别的设备上**改过微软账户的密码**，会出现：
+
+> 明明密码是对的，远程桌面却一直提示「用户名或密码不正确」
+
+**原因**：这台电脑本地缓存的是**旧密码凭据**，Windows 登录时用的是缓存，
+还没跟微软云端同步。
+
+**解决办法 —— 在这台电脑上注销并重新登录一次**：
+
+```
+开始菜单 → 头像 → 注销
+→ 重新登录（保持联网）
+```
+
+**登一次就刷新了缓存凭据**，之后远程桌面就能用新密码连了。
+
+**几个补充**：
+
+| 情况 | 要不要重新登录 |
+|---|---|
+| 改过微软账户密码 | **要**，否则 RDP 一直验证失败 |
+| 开了双重验证 / 换了设备 | **建议要**，重新走一次验证 |
+| 只是睡眠 / 休眠唤醒 | 一般不用，但**偶尔**唤醒后 RDP 会要求重新认证，正常现象 |
+| 用的是本地账户 | **不需要**，本地账户改密码立刻生效 |
+
+**如果暂时不方便注销**，可以用这条命令触发一次联网凭据刷新：
+
+```powershell
+runas /user:MicrosoftAccount\你的邮箱 cmd
+```
+
+它会弹一次联网验证，通过后凭据就更新了。
+
+---
+
 ## 配合 OpenClash 的大陆绕过
 
 「忽略国外 IP」这个功能需要一份**中国大陆 IP 段**。这份数据不用你自己维护 ——
