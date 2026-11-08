@@ -284,6 +284,86 @@ Restart-Service TermService -Force
 
 ---
 
+## 配合 OpenClash 的大陆绕过
+
+「忽略国外 IP」这个功能需要一份**中国大陆 IP 段**。这份数据不用你自己维护 ——
+如果你路由器上装了 **OpenClash**，可以直接复用它的「**绕过中国大陆 IP**」数据。
+
+### 怎么开
+
+**OpenClash 这边**（如果还没开）：
+
+```
+OpenClash → 全局设置 → 中国大陆 IP 绕过
+    ☑ 启用绕过中国大陆 IP        ← uci: openclash.config.china_ip_route='1'
+```
+
+开启后 OpenClash 会生成并**每周一自动更新**这两个文件：
+
+```
+/etc/openclash/china_ip_route.ipset      ← IPv4
+/etc/openclash/china_ip6_route.ipset     ← IPv6
+```
+
+**本插件这边**：
+
+```
+自动唤醒 → 设置 → 国内 IP 数据来源 → 用 OpenClash 的数据文件（推荐）
+```
+
+### 它是怎么工作的
+
+```
+OpenClash 每周一更新 china_ip_route.ipset
+        ↓
+本插件读取这个文件，把 CIDR 灌进自己的 ipset
+        ↓
+wol_cn4（IPv4）/ wol_cn6（IPv6）
+        ↓
+防火墙日志里来的来源 IP 拿这两个集合做判断
+```
+
+### 两个关键设计
+
+**① 零维护**
+
+数据跟着 OpenClash 一起更新，不用你管。
+要手动刷新：**设置 → 维护操作 → 重建国内 IP 表**。
+
+**② 不依赖 OpenClash 运行状态**
+
+插件**不使用** OpenClash 自己的 nft 集合 —— 那个集合只在 OpenClash **运行时**才存在。
+
+插件只是把 CIDR 从文件里读出来，灌进**自己的** ipset。所以：
+
+| OpenClash 状态 | 插件是否正常 |
+|---|---|
+| **开着** | ✅ 正常 |
+| **关了** | ✅ 正常 |
+| **卸载了** | ✅ 只要 ipset 还在就正常 |
+
+### 没装 OpenClash 怎么办
+
+把数据来源改成 **「自己下载」** —— 插件会从公开源拉取国内 IP 段并缓存到：
+
+```
+/etc/wol-autowake/cn_ipv4.txt
+/etc/wol-autowake/cn_ipv6.txt
+```
+
+之后每 7 天自动检查一次更新。
+
+### 判断依据
+
+来源 IP 命中 `wol_cn4` / `wol_cn6` 就算「中国大陆」，允许唤醒；
+不命中且开启了「忽略国外 IP」，就只写日志、不发魔术包。
+
+> 局域网私有地址（`192.168.x` / `10.x` / `172.16-31.x`）、IPv6 ULA、链路本地地址
+> 一律当作**可信**，不会被这个过滤挡掉 —— 因为在家用内网地址、
+> 或者「内网走公网」方式访问时，来源就是这些地址。
+
+---
+
 ## 常见问题
 
 **Q：设备列表里显示「在线」，但远程还是连不上？**
