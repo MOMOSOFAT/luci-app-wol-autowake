@@ -200,7 +200,7 @@ var GLOBAL_FIELDS = [
 	  desc: _('无条件唤醒，优先级最高') },
 
 	{ key: 'blacklist', type: 'TextValue', title: _('手动黑名单'), def: '',
-	  rows: 3, placeholder: '47.111.94.76',
+	  rows: 3, placeholder: '198.51.100.20',
 	  desc: _('一律不唤醒') }
 ];
 
