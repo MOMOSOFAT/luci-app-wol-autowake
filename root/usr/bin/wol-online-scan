@@ -1,0 +1,114 @@
+#!/bin/sh
+# ==============================================================================
+#  wol-online-scan  --  扫一轮设备在线状态，写 /tmp/wol-online.list
+#
+#  为什么单独拆出来:
+#    页面读取状态走 CGI（/cgi-bin/wol-status）。如果让 CGI 自己 ping，
+#    离线设备必须等满 -W 1 超时 -> 每次请求卡 1 秒，还会把 uhttpd 的其他请求一起堵住。
+#    所以改成【后台定时扫】，CGI 只读结果文件 -> 每次调用都是毫秒级。
+#
+#  三种检测方式（UCI: settings.scan_mode）
+#    ping    自适应 ping
+#              上一轮离线的设备：每轮都 ping（尽快发现它开机）
+#              上一轮在线的设备：每 scan_online_every 轮才真 ping 一次（少打扰、少耗电）
+#    hybrid  组合
+#              先读邻居表（ARP）：有完整表项 => 直接算在线，【零发包】
+#              没有表项才 ping 一次
+#    arp     纯被动
+#              只读邻居表，【一个包都不发】
+#              代价：设备关机后可能仍显示"在线"几分钟（表项过期没那么快）
+#
+#  谁来调:
+#    · wol-autowake.sh 守护进程（后台循环，默认每 10 秒一次）—— 主力
+#    · cron（每分钟一次）—— 兜底，服务被停用时也能保持显示正确
+#
+#  输出:
+#    /tmp/wol-online.list   每行一个"在线"的 IP（不在里面的就是离线）
+#    /tmp/wol-online.ts     扫描时间戳
+#
+#  ⚠️ 只影响界面显示 —— 唤醒判断在 wol-autowake.sh 里始终实时 ping。
+# ==============================================================================
+
+. /lib/functions.sh
+
+CACHE_ONLINE="/tmp/wol-online.list"
+CACHE_TS="/tmp/wol-online.ts"
+PINGDIR="/tmp/wol-ping.$$"
+ROUND_FILE="/tmp/wol-scan.round"
+
+config_load wol_autowake
+config_get MODE settings scan_mode "ping"
+config_get ONLINE_EVERY settings scan_online_every "6"
+config_get ONLINE_SEC settings scan_online_sec ""
+config_get SCAN_INT settings scan_interval "10"
+if [ -n "$ONLINE_SEC" ] && [ "$SCAN_INT" -gt 0 ] 2>/dev/null; then ONLINE_EVERY=$((ONLINE_SEC / SCAN_INT)); fi
+
+case "$ONLINE_EVERY" in ''|*[!0-9]*) ONLINE_EVERY=6 ;; esac
+[ "$ONLINE_EVERY" -lt 1 ] && ONLINE_EVERY=1
+
+# 轮次计数（"在线设备每 N 轮才 ping"要用）
+ROUND=$(cat "$ROUND_FILE" 2>/dev/null || echo 0)
+case "$ROUND" in ''|*[!0-9]*) ROUND=0 ;; esac
+ROUND=$((ROUND + 1))
+[ "$ROUND" -ge 100000 ] && ROUND=1
+printf '%s\n' "$ROUND" > "$ROUND_FILE" 2>/dev/null
+
+# 邻居表里有没有这台设备（Flags=0x2 表示表项完整有效）
+arp_complete() {
+	awk -v ip="$1" '$1 == ip && $3 == "0x2" { found = 1 } END { exit !found }' \
+		/proc/net/arp 2>/dev/null
+}
+
+rm -rf "$PINGDIR" 2>/dev/null
+mkdir -p "$PINGDIR" 2>/dev/null
+
+ping_one() {
+	local s="$1" ip in_cache
+	config_get ip "$s" ip
+	[ -n "$ip" ] || return 0
+
+	in_cache=0
+	grep -qxF "$ip" "$CACHE_ONLINE" 2>/dev/null && in_cache=1
+
+	case "$MODE" in
+		arp)
+			# 纯被动：一个包都不发
+			arp_complete "$ip" && : > "$PINGDIR/$ip"
+			;;
+
+		hybrid)
+			# 先读邻居表，命中就零发包
+			if arp_complete "$ip"; then
+				: > "$PINGDIR/$ip"
+			else
+				( ping -c 1 -W 1 "$ip" >/dev/null 2>&1 && : > "$PINGDIR/$ip" ) &
+			fi
+			;;
+
+		*)
+			# 自适应 ping：上一轮在线的，每 N 轮才真 ping 一次
+			if [ "$in_cache" = "1" ] && [ $((ROUND % ONLINE_EVERY)) -ne 0 ]; then
+				: > "$PINGDIR/$ip"                    # 沿用上一轮结果
+			else
+				( ping -c 1 -W 1 "$ip" >/dev/null 2>&1 && : > "$PINGDIR/$ip" ) &
+			fi
+			;;
+	esac
+}
+config_foreach ping_one device
+wait                                     # 并行 -> 只等一次超时，不是 N 次
+
+# 汇总成在线清单，原子替换
+: > "$CACHE_ONLINE.new" 2>/dev/null
+for f in "$PINGDIR"/*; do
+	[ -f "$f" ] || continue
+	printf '%s\n' "${f##*/}" >> "$CACHE_ONLINE.new"
+done
+mv "$CACHE_ONLINE.new" "$CACHE_ONLINE" 2>/dev/null
+printf '%s\n' "$(date +%s)" > "$CACHE_TS" 2>/dev/null
+rm -rf "$PINGDIR" 2>/dev/null
+
+# 清掉 5 分钟前被中断留下的僵尸目录
+find /tmp -maxdepth 1 -name 'wol-ping.*' -mmin +5 -exec rm -rf {} + 2>/dev/null
+
+exit 0
