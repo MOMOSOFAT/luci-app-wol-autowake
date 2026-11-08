@@ -1,0 +1,13 @@
+# 构建产物（用 build-ipk.py 本地生成，不入库）
+*.ipk
+*.tar.gz
+paste-install.sh
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# 本地测试
+/test/
