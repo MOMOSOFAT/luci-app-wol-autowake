@@ -49,7 +49,7 @@ opkg install etherwake ipset ip-full
 ### 方式一：IPK
 
 ```sh
-opkg install luci-app-wol-autowake_1.0.0-1_all.ipk
+opkg install luci-app-wol-autowake_1.0.1-1_all.ipk
 ```
 
 安装后刷新 LuCI。
@@ -57,7 +57,7 @@ opkg install luci-app-wol-autowake_1.0.0-1_all.ipk
 ### 方式二：tar.gz 手动安装
 
 ```sh
-tar -xzf luci-app-wol-autowake-1.0.0.tar.gz
+tar -xzf luci-app-wol-autowake-1.0.1.tar.gz
 cd luci-app-wol-autowake
 sh install.sh
 /etc/init.d/wol-autowake enable

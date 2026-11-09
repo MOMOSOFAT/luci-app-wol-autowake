@@ -22,7 +22,7 @@ import tarfile
 import time
 
 PKG      = "luci-app-wol-autowake"
-VERSION  = "1.0.0"
+VERSION  = "1.0.1"
 RELEASE  = "1"
 ARCH     = "all"
 SECTION  = "luci"

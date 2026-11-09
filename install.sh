@@ -3,7 +3,7 @@
 #  luci-app-wol-autowake 安装脚本（apk 系统 / opkg 系统通用）
 #
 #  用法（路由器上，先解包）:
-#      tar -xzf luci-app-wol-autowake-1.0.0.tar.gz -C /tmp
+#      tar -xzf luci-app-wol-autowake-1.0.1.tar.gz -C /tmp
 #      sh /tmp/luci-app-wol-autowake/install.sh
 #
 #  参数:
@@ -20,7 +20,7 @@
 # ==============================================================================
 
 PKG="luci-app-wol-autowake"
-VER="1.0.0"
+VER="1.0.1"
 REL="0"
 
 SELF_DIR=$(cd "$(dirname "$0")" && pwd)
