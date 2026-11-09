@@ -45,8 +45,8 @@ echo "-> 写入文件 ..."
 
 FOOTER = '''
 # ---------------------------------------------------------------- 权限
-chmod 755 /etc/init.d/wol-autowake /usr/bin/wol-wake /usr/bin/wol-status /usr/bin/wol-logclean /usr/bin/wol-online-scan /usr/bin/wol-cnlist /usr/libexec/wol-autowake.sh 2>/dev/null
-chmod 755 /www/cgi-bin/wol-status /www/cgi-bin/wol-ctl 2>/dev/null
+chmod 755 /etc/init.d/wol-autowake /usr/bin/wol-wake /usr/bin/wol-status /usr/bin/wol-geo /usr/bin/wol-geo-lookup /usr/bin/wol-autoblock /usr/bin/wol-blfw /usr/bin/wol-logclean /usr/bin/wol-online-scan /usr/bin/wol-cnlist /usr/libexec/wol-autowake.sh 2>/dev/null
+chmod 755 /www/cgi-bin/wol-status /www/cgi-bin/wol-ctl /www/cgi-bin/wol-log 2>/dev/null
 chmod 644 /etc/config/wol_autowake 2>/dev/null
 chmod 644 /usr/share/rpcd/acl.d/luci-app-wol-autowake.json 2>/dev/null
 chmod 644 /usr/share/luci/menu.d/luci-app-wol-autowake.json 2>/dev/null
@@ -62,12 +62,15 @@ rm -f /www/luci-static/resources/view/wol-autowake/devices.js \\
 if [ -d /etc/crontabs ]; then
 \tCRONF=/etc/crontabs/root
 \t[ -f "$CRONF" ] || touch "$CRONF"
-\tsed -i '/# WOLAUTO-LOGCLEAN/,/# WOLAUTO-END/d' "$CRONF" 2>/dev/null
+\tsed -i '/^# WOLAUTO-APP --/,/^# WOLAUTO-APP-END$/d' "$CRONF" 2>/dev/null
 \techo "" >> "$CRONF"
-\techo "# WOLAUTO-LOGCLEAN -- 由 luci-app-wol-autowake 管理，请勿手改下面几行" >> "$CRONF"
+\techo "# WOLAUTO-APP -- 由 luci-app-wol-autowake 管理，请勿手改下面几行" >> "$CRONF"
+\techo "20 4 * * 1 /usr/bin/wol-cnlist ensure >/dev/null 2>&1" >> "$CRONF"
 \techo "* * * * * /usr/bin/wol-online-scan >/dev/null 2>&1" >> "$CRONF"
+\techo "* * * * * /usr/bin/wol-autoblock >/dev/null 2>&1" >> "$CRONF"
+\techo "*/5 * * * * /usr/bin/wol-geo >/dev/null 2>&1" >> "$CRONF"
 \techo "17 * * * * /usr/bin/wol-logclean >/dev/null 2>&1" >> "$CRONF"
-\techo "# WOLAUTO-END" >> "$CRONF"
+\techo "# WOLAUTO-APP-END" >> "$CRONF"
 \t/etc/init.d/cron enable  >/dev/null 2>&1
 \t/etc/init.d/cron restart >/dev/null 2>&1
 \techo "-> 在线扫描 + 日志清理的 cron 任务已装"
@@ -127,7 +130,7 @@ def main():
                 data = f.read().replace("\r\n", "\n").replace("\r", "\n")
             target = "/" + rel
             d = safe_delim(data)
-            parts.append('\nmkdir -p "%s"' % os.path.dirname(target))
+            parts.append('\nmkdir -p "%s"\n' % os.path.dirname(target))
             if rel in KEEP_IF_EXISTS:
                 parts.append('if [ -f "%s" ]; then' % target)
                 parts.append('\techo "   保留已有配置 %s"' % target)

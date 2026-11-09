@@ -15,6 +15,7 @@
 #     fw_name      -- 规则名
 #   log:  最近唤醒记录（优先读 /root/wol-autowake.log）
 #   seen: 可疑来源 IP 列表（从日志里提取，带次数/设备/归属/是否已拉黑）
+#   geo:  IP -> 归属地（国家 省 市），来自 wol-geo 的本地缓存；查不到就没有该项
 #
 # 性能相关的设计（页面"打开慢"就靠这一条）:
 #   本脚本【绝不 ping】—— 在线状态由 wol-online-scan 在后台定时扫好（守护进程每 10 秒
@@ -36,7 +37,12 @@ b()    { [ "$1" = "1" ] && echo true || echo false; }
 config_load wol_autowake
 config_get IFACE settings iface "br-lan"
 config_get THROTTLE settings throttle "60"
-config_get_bool LOGREAD settings logread 1
+# 日志监听已固定开启（设置项已移除），这里保留字段只为兼容旧状态输出
+LOGREAD=1
+config_get_bool GEO_ENABLED settings geo_enabled 1
+
+# ------------------------------------------------------------------ 归属地缓存
+#   归属地由 cron 定期刷新；这里只读缓存，绝不在页面请求里等待查询。
 
 running=false
 pgrep -f '[w]ol-autowake.sh' >/dev/null 2>&1 && running=true
@@ -48,17 +54,14 @@ cfgok=false
 [ -f /etc/config/wol_autowake ] && cfgok=true
 
 # ------------------------------------------------------------------ 在线状态
-# 【本脚本绝不 ping】
-#   在线状态由后台的 wol-online-scan 定时扫好写进文件（守护进程每 10 秒一次，
-#   cron 每分钟兜底一次），这里只读文件。
-#   这样每次请求都是毫秒级，也不会卡住 uhttpd 的其他请求。
-#   ⚠️ 唤醒判断不受影响 —— wol-autowake.sh 每次仍然实时 ping。
+# 在线状态由后台 wol-online-scan 自适应探测后写入缓存，本脚本只读。
 CACHE_ONLINE="/tmp/wol-online.list"     # 每行一个"在线"的 IP
 
 # 来源过滤的状态（给界面状态卡片用）
 _IGN=$(uci -q get wol_autowake.settings.ignore_foreign 2>/dev/null)
 _SRC=$(uci -q get wol_autowake.settings.cn_source 2>/dev/null)
 _IV6=$(uci -q get wol_autowake.settings.ignore_ipv6 2>/dev/null)
+_PRESET=$(uci -q get wol_autowake.settings.blacklist_preset 2>/dev/null)
 case "$_IGN" in 1) IGN_B=1 ;; *) IGN_B=0 ;; esac
 case "$_IV6" in 0) IV6_B=0 ;; *) IV6_B=1 ;; esac
 case "$_SRC" in download) SRC_NAME=download ;; *) SRC_NAME=openclash ;; esac
@@ -66,6 +69,7 @@ CN_CNT=$(ipset list wol_cn4 2>/dev/null | sed -n 's/^Number of entries: //p')
 CN_CNT=${CN_CNT:-0}
 BL_CNT=$(ipset list wol_bl4 2>/dev/null | sed -n 's/^Number of entries: //p')
 BL_CNT=${BL_CNT:-0}
+BL_MEMBERS=$(ipset list wol_bl4 2>/dev/null | sed -n '/^Members:/,$p' | tail -n +2 | tr '\n' ' ')
 # 集合是否就绪
 if [ "$CN_CNT" -gt 0 ] 2>/dev/null; then CN_OK=1; else CN_OK=0; fi
 # 今日统计
@@ -75,13 +79,16 @@ _TODAY=$(date '+%Y-%m-%d' 2>/dev/null)
 # 忽略行里含"不唤醒"三个字，用 ".*唤醒" 会把忽略行也算成唤醒（之前就这样算错了）
 IGN_TODAY=$(grep -c "^$_TODAY .*忽略 \[" /root/wol-autowake.log 2>/dev/null || true)
 WOKE_TODAY=$(grep -c "^$_TODAY .*唤醒 \[" /root/wol-autowake.log 2>/dev/null || true)
+BL_TODAY=$(grep "^$_TODAY .*自动黑名单 " /root/wol-autowake.log 2>/dev/null \
+	| sed -n 's/.*自动黑名单 \([0-9a-fA-F.:]*\).*/\1/p' | sort -u | wc -l | tr -d ' ' || true)
 IGN_TODAY=${IGN_TODAY:-0}
 WOKE_TODAY=${WOKE_TODAY:-0}
+BL_TODAY=${BL_TODAY:-0}
 
 # ------------------------------------------------------------------ 输出
-printf '{"running":%s,"etherwake":%s,"config_ok":%s,"iface":"%s","throttle":"%s","logread":%s,"filter":{"on":%s,"src":"%s","cn":%s,"cn_ok":%s,"bl":%s,"ipv6":%s,"ign":%s,"woke":%s},"devices":[' \
+printf '{"running":%s,"etherwake":%s,"config_ok":%s,"iface":"%s","throttle":"%s","logread":%s,"filter":{"on":%s,"src":"%s","cn":%s,"cn_ok":%s,"bl":%s,"bl_today":%s,"ipv6":%s,"ign":%s,"woke":%s},"devices":[' \
 	"$running" "$tool" "$cfgok" "$(jesc "$IFACE")" "$(jesc "$THROTTLE")" "$(b "$LOGREAD")" \
-	"$(b "$IGN_B")" "$SRC_NAME" "$CN_CNT" "$(b "$CN_OK")" "$BL_CNT" "$(b "$IV6_B")" "$IGN_TODAY" "$WOKE_TODAY"
+	"$(b "$IGN_B")" "$SRC_NAME" "$CN_CNT" "$(b "$CN_OK")" "$BL_CNT" "$BL_TODAY" "$(b "$IV6_B")" "$IGN_TODAY" "$WOKE_TODAY"
 
 FIRST=1
 emit_dev() {
@@ -101,7 +108,7 @@ emit_dev() {
 	[ -n "$dport" ] || dport=3389
 	[ -n "$proto" ] || proto="tcp"
 
-	# 在线状态：查上面那份清单（并行探测 + 缓存的结果）
+	# 在线状态：后台自适应探测写入的缓存
 	online=false
 	if [ -n "$ip" ] && grep -qxF "$ip" "$CACHE_ONLINE" 2>/dev/null; then
 		online=true
@@ -160,11 +167,16 @@ SEEN_JSON=""
 LOGF=/root/wol-autowake.log
 if [ -s "$LOGF" ]; then
 	# 用 sed 先把每行规整成: 时间戳|来源IP|设备|结果
-	#   （不能用 awk 的 index()/substr() 定位 "来源=" —— 那是字节偏移，
+	#   （不能用 awk 的 index()/substr 定位 "来源=" —— 那是字节偏移，
 	#     而中文是多字节，会多跳一个字节，把 IP 的第一位吃掉）
 	# 输出按【最近时间倒序】：把时间戳放第一列，用最朴素的 sort -r，
 	# 避开 BusyBox sort 对 -k/-t 修饰符支持不全的坑。
-	AGG=$(tail -n 400 "$LOGF" 2>/dev/null \
+	#
+	# 扫描【整个日志】，不能只 tail -n 400：
+	#   日志里同一批扫描器会反复出现（单个 IP 几百次），400 行窗口会被
+	#   少数几个 IP 占满，其它来源全被挤掉 —— 界面就表现为“只显示几条”。
+	#   日志本身由 wol-logclean 限制在 256KB 以内，全量扫描开销很小。
+	AGG=$(cat "$LOGF" 2>/dev/null \
 		| sed -n 's/^\([0-9][0-9-]* [0-9:]*\)  \(忽略\|唤醒\) \[\([^]]*\)\].*来源=\([0-9a-fA-F.:]*\).*/\1|\4|\3|\2/p' \
 		| awk -F'|' '{
 			cnt[$2]++; last[$2] = $1; devs[$2] = $3; kinds[$2] = $4
@@ -183,6 +195,15 @@ if [ -s "$LOGF" ]; then
 			fc*|fd*|fe8*|fe9*|fea*|feb*) continue ;;
 		esac
 
+		# 扫描器预设里的 IP 已知是扫描器，不再放进可疑来源（用静态 /24 前缀，避免逐 IP 调 ipset）
+		if [ "$_PRESET" = "1" ]; then
+			case "$ip" in
+				47.111.94.*|139.224.0.*|47.96.0.*|47.98.0.*|106.14.0.*|120.24.0.*|116.62.0.*|121.40.0.*|\
+				113.200.2.*|81.68.0.*|129.28.0.*|119.29.29.*|1.12.0.*|49.232.0.*|122.152.0.*|140.143.0.*|175.24.0.*)
+					continue ;;
+			esac
+		fi
+
 		cn=false; bl=false
 		is6=false
 		case "$ip" in
@@ -193,7 +214,9 @@ if [ -s "$LOGF" ]; then
 		else
 			ipset test wol_cn4 "$ip" >/dev/null 2>&1 && cn=true
 		fi
-		ipset test wol_bl4 "$ip" >/dev/null 2>&1 && bl=true
+		case " $BL_MEMBERS " in
+			*" $ip "*) bl=true ;;
+		esac
 		# 筛选规则：国外来源一律列出；国内来源只列"次数 >= 3"的（偶发访问的多半是误报）
 		if [ "$cn" = "true" ] && [ "${n:-0}" -lt 3 ] 2>/dev/null; then
 			continue
@@ -203,25 +226,78 @@ if [ -s "$LOGF" ]; then
 	done | head -n 50)
 fi
 
-# ------------------------------------------------------------------ 最近 10 条唤醒/忽略记录
-#   无论是否真的唤醒了，都列出来（唤醒 + 忽略），格式与"可疑 IP"一致
+# ------------------------------------------------------------------ 最近唤醒 / 忽略记录
+#   界面可切换「成功唤醒」和「忽略记录」，每类默认显示最近 5 条，其余折叠。
+#   全日志扫描，两类各最多取最近 50 个不同 IP（同 IP 只保留最新一条）。
 EVENTS_JSON=""
 if [ -s "$LOGF" ]; then
-	EV=$( { tail -n 400 "$LOGF" 2>/dev/null \
-			| sed -n 's/^\([0-9][0-9-]* [0-9:]*\)  唤醒 \[\([^]]*\)\].*端口=\([0-9][0-9]*\) .*来源=\([0-9a-fA-F.:]*\).*/\1|唤醒|\2|\3|\4|已发魔术包/p'
-		tail -n 400 "$LOGF" 2>/dev/null \
-			| sed -n 's/^\([0-9][0-9-]* [0-9:]*\)  忽略 \[\([^]]*\)\] 来源=\([0-9a-fA-F.:]*\)（\(.*\)）$/\1|忽略|\2|-|\3|\4/p'
-	      } | sort -r | head -n 10)
+	EV=$( {
+		{ sed -n 's/^\([0-9][0-9-]* [0-9:]*\)  唤醒 \[\([^]]*\)\] 手动唤醒 端口=\([^ ]*\) 来源=\(.*\)$/\1|唤醒|\2|\3|\4|手动唤醒/p' "$LOGF" 2>/dev/null
+		  sed -n 's/^\([0-9][0-9-]* [0-9:]*\)  唤醒 \[\([^]]*\)\].*端口=\([0-9][0-9]*\) .*来源=\([^ ]*\).*/\1|唤醒|\2|\3|\4|已发魔术包/p' "$LOGF" 2>/dev/null
+		} | sort -r | awk -F'|' '
+			{ k=$5; if (k=="") k="manual|"$3"|"$1
+			  if (!(k in cnt)) { order[++n]=k; line[k]=$0 }
+			  cnt[k]++ }
+			END { for (i=1; i<=n; i++) { k=order[i]; print line[k] "|" cnt[k] } }
+		' | head -n 50
+		sed -n 's/^\([0-9][0-9-]* [0-9:]*\)  忽略 \[\([^]]*\)\] 来源=\([0-9a-fA-F.:]*\)（\(.*\)）$/\1|忽略|\2|-|\3|\4/p' "$LOGF" 2>/dev/null \
+			| sort -r | awk -F'|' '
+				{ k=$5
+				  if (!(k in cnt)) { order[++n]=k; line[k]=$0 }
+				  cnt[k]++ }
+				END { for (i=1; i<=n; i++) { k=order[i]; print line[k] "|" cnt[k] } }
+			' | head -n 50
+	      } | sort -r)
 
-	EVENTS_JSON=$(printf '%s\n' "$EV" | while IFS='|' read -r ts kind dev port ip why; do
+	EVENTS_JSON=$(printf '%s\n' "$EV" | while IFS='|' read -r ts kind dev port ip why cnt; do
 		[ -n "$ts" ] || continue
-		printf '{"ts":"%s","kind":"%s","dev":"%s","port":"%s","ip":"%s","why":"%s"},' \
+		printf '{"ts":"%s","kind":"%s","dev":"%s","port":"%s","ip":"%s","why":"%s","n":%s},' \
 			"$(jesc "$ts")" "$(jesc "$kind")" "$(jesc "$dev")" \
-			"$(jesc "$port")" "$(jesc "$ip")" "$(jesc "$why")"
+			"$(jesc "$port")" "$(jesc "$ip")" "$(jesc "$why")" "${cnt:-1}"
 	done)
+fi
+
+# ------------------------------------------------------------------ 归属地
+#   wol-geo 把查询结果写进 /root/wol-geo.cache（IP<TAB>时间戳<TAB>归属地），
+#   这里只读缓存拼成 {ip: "国家 省 市"}，不在这里发网络请求。
+TAB=$(printf '\t')
+GEO_JSON=""
+GEO_SEP=""
+if [ "$GEO_ENABLED" = "1" ] && [ -s /root/wol-geo.cache ]; then
+	while IFS="$TAB" read -r gip gts gtext; do
+		[ -n "$gip" ] || continue
+		[ -n "$gtext" ] || continue
+		GEO_JSON="$GEO_JSON$GEO_SEP\"$(jesc "$gip")\":\"$(jesc "$gtext")\""
+		GEO_SEP=,
+	done < /root/wol-geo.cache
+fi
+
+# ------------------------------------------------------------------ 自动黑名单
+#   /etc/wol-autowake/autoblack.list 每行 IP<TAB>过期时间戳（0=永久）
+AUTO_BL_JSON=""
+AUTO_BL_SEP=""
+if [ -s /etc/wol-autowake/autoblack.list ]; then
+	while IFS="$TAB" read -r aip aexp; do
+		[ -n "$aip" ] || continue
+		AUTO_BL_JSON="$AUTO_BL_JSON$AUTO_BL_SEP{\"ip\":\"$(jesc "$aip")\",\"expire\":${aexp:-0}}"
+		AUTO_BL_SEP=,
+	done < /etc/wol-autowake/autoblack.list
 fi
 
 printf ',"log":"%s"' "$logtxt"
 printf ',"seen":[%s]' "${SEEN_JSON%,}"
-printf ',"events":[%s]}\n' "${EVENTS_JSON%,}"
+printf ',"events":[%s]' "${EVENTS_JSON%,}"
+printf ',"geo":{%s}' "$GEO_JSON"
+printf ',"autobl":[%s]' "$AUTO_BL_JSON"
+
+BLACKLIST_JSON=""
+BLACKLIST_SEP=""
+if [ -s /etc/wol-autowake/blacklist.list ]; then
+	while IFS="$TAB" read -r blip blexp blsrc; do
+		[ -n "$blip" ] || continue
+		BLACKLIST_JSON="$BLACKLIST_JSON$BLACKLIST_SEP{\"ip\":\"$(jesc "$blip")\",\"expire\":${blexp:-0},\"source\":\"$(jesc "${blsrc:-manual}")\"}"
+		BLACKLIST_SEP=,
+	done < /etc/wol-autowake/blacklist.list
+fi
+printf ',"blacklist":[%s]}\n' "$BLACKLIST_JSON"
 exit 0

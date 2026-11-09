@@ -138,22 +138,22 @@ fw_ensure() {
 #
 #  由设置项 wol_autowake.settings.wake_hairpin 控制（默认 0 = 不加规则）。
 # ==============================================================================
-HAIRPIN_FILE="/etc/nftables.d/90-wolautowake.nft"
+HAIRPIN_FILE="/etc/wol-autowake/hairpin.nft"
+HAIRPIN_OLD="/etc/nftables.d/90-wolautowake.nft"
 
 # $1=1 生成  $2=0 删除
 fw_hairpin() {
 	local want="$1" iface subnet subnet6 ports port nft tmp
 
 	if [ "$want" != "1" ]; then
-		if [ -f "$HAIRPIN_FILE" ]; then
-			rm -f "$HAIRPIN_FILE"
-		fi
+		rm -f "$HAIRPIN_FILE" "$HAIRPIN_OLD"
 		# 文件删了还不够，运行中的表也要撤掉，否则规则会一直生效到下次重启
 		nft delete table inet wolautowake >/dev/null 2>&1
 		return 0
 	fi
 
-	mkdir -p /etc/nftables.d 2>/dev/null
+	mkdir -p /etc/wol-autowake 2>/dev/null
+	rm -f "$HAIRPIN_OLD" 2>/dev/null
 
 	# 接口
 	iface=$(uci -q get wol_autowake.settings.iface)

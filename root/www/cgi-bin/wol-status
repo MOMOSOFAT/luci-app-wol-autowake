@@ -1,8 +1,8 @@
 #!/bin/sh
 # ==============================================================================
 # wol-status (CGI) -- 给 LuCI 页面读状态
-#   GET /cgi-bin/wol-status        -> JSON
-# 由 uhttpd 直接执行，不走 ubus/rpcd，所以不依赖 rpcd-mod-file
+#   GET /cgi-bin/wol-status          -> 优先返回缓存（页面首屏快）
+#   GET /cgi-bin/wol-status?fresh=1  -> 重新计算，内容有变化才覆盖缓存
 # ==============================================================================
 
 echo "Content-Type: application/json"
@@ -15,10 +15,26 @@ case "${REMOTE_ADDR:-}" in
 	*) printf '{"error":"forbidden"}\n'; exit 0 ;;
 esac
 
+CACHE=/tmp/wol-status.cache
+FRESH=0
+case "?${QUERY_STRING:-}" in
+	*'?fresh=1'*) FRESH=1 ;;
+esac
+
+# 首屏直接用缓存，不再跑脚本
+if [ "$FRESH" != "1" ] && [ -s "$CACHE" ]; then
+	cat "$CACHE"
+	exit 0
+fi
+
 out=$(/usr/bin/wol-status 2>&1)
 
 case "$out" in
 	\{*)
+		# 内容没变就不写，变了才原子覆盖
+		if [ "$out" != "$(cat "$CACHE" 2>/dev/null)" ]; then
+			printf '%s\n' "$out" > "$CACHE.tmp" 2>/dev/null && mv "$CACHE.tmp" "$CACHE"
+		fi
 		printf '%s\n' "$out"
 		;;
 	*)

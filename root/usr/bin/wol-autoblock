@@ -1,0 +1,192 @@
+#!/usr/bin/lua
+-- ==============================================================================
+-- wol-autoblock -- 自动黑名单：每分钟访问次数超过阈值就加入
+--
+--   由 cron 每分钟调用；配置来自 wol_autowake.settings：
+--     autobl_enabled  0/1
+--     autobl_per_min  每分钟访问次数
+--     autobl_expire   自动解封（小时，留空/0=永久）
+--     blacklist_fw    1=同时同步防火墙
+--
+--   自动名单：/etc/wol-autowake/autoblack.list
+--     每行: IP<TAB>过期时间戳（0=永久）
+-- ==============================================================================
+
+local AUTO = "/etc/wol-autowake/autoblack.list"
+local SKIP = "/etc/wol-autowake/autoblack.skip"
+local LOG  = "/root/wol-autowake.log"
+
+local function uci(key, default)
+	local f = io.popen("uci -q get " .. key .. " 2>/dev/null")
+	if not f then return default end
+	local v = f:read("*a") or ""
+	f:close()
+	v = v:gsub("%s+$", "")
+	if v == "" then return default end
+	return v
+end
+
+if uci("wol_autowake.settings.autobl_enabled", "1") == "0" then
+	os.exit(0)
+end
+
+os.execute("mkdir -p /etc/wol-autowake")
+
+local per_min = tonumber(uci("wol_autowake.settings.autobl_per_min", "20")) or 20
+local total_hits = tonumber(uci("wol_autowake.settings.autobl_total", "100")) or 0
+-- 留空 = 永久；0 也按永久处理
+local expire = tonumber(uci("wol_autowake.settings.autobl_expire", ""))
+local fw     = (uci("wol_autowake.settings.blacklist_fw", "0") == "1")
+
+local whitelist = {}
+for w in uci("wol_autowake.settings.whitelist", ""):gmatch("[^%s,;]+") do
+	whitelist[w] = true
+end
+local manual = {}
+for w in uci("wol_autowake.settings.blacklist", ""):gmatch("[^%s,;]+") do
+	manual[w] = true
+end
+
+local now   = os.time()
+local start = now - 60
+
+local counts = {}
+local totals = {}
+local f = io.open(LOG, "r")
+if not f then os.exit(0) end
+for line in f:lines() do
+	local ts, ip = line:match("^(%d%d%d%d%-%d%d%-%d%d %d%d:%d%d:%d%d)%s+忽略 %[[^%]]+%].-来源=([%w%.:]+)")
+	if ts and ip then
+		local y, mo, d, h, mi, s =
+			ts:match("(%d+)-(%d+)-(%d+) (%d+):(%d+):(%d+)")
+		local t = os.time({
+			year = tonumber(y), month = tonumber(mo), day = tonumber(d),
+			hour = tonumber(h), min = tonumber(mi), sec = tonumber(s)
+		})
+		if t then
+			totals[ip] = (totals[ip] or 0) + 1
+			if t >= start then
+				counts[ip] = (counts[ip] or 0) + 1
+			end
+		end
+	end
+end
+f:close()
+
+-- 读取现有自动名单，清掉过期的
+local auto = {}
+local removed = 0
+local expired = {}
+local af = io.open(AUTO, "r")
+if af then
+	for line in af:lines() do
+		local ip, exp = line:match("^([^\t]+)\t(%d+)$")
+		if ip then
+			local e = tonumber(exp) or 0
+			if e == 0 or e > now then
+				auto[ip] = e
+			else
+				removed = removed + 1
+				expired[ip] = true
+			end
+		end
+	end
+	af:close()
+end
+
+for ip in pairs(expired) do
+	os.execute("ipset del wol_bl4 '" .. ip .. "' 2>/dev/null")
+end
+
+-- 手动解封后的 24 小时抑制名单
+local skip = {}
+local sf = io.open(SKIP, "r")
+if sf then
+	for line in sf:lines() do
+		local ip, exp = line:match("^([^\t]+)\t(%d+)$")
+		if ip and tonumber(exp) and tonumber(exp) > now then
+			skip[ip] = true
+		end
+	end
+	sf:close()
+end
+
+local function is_private(ip)
+	if ip:match("^10%.") or ip:match("^192%.168%.") or ip:match("^127%.") then
+		return true
+	end
+	if ip:match("^172%.1[6-9]%.") or ip:match("^172%.2%d%.") or ip:match("^172%.3[01]%.") then
+		return true
+	end
+	return false
+end
+
+local added = 0
+-- 自动名单可能先于服务建表，确保 ipset 存在
+os.execute("ipset create wol_bl4 hash:net family inet hashsize 1024 maxelem 8192 2>/dev/null")
+local all = {}
+for ip in pairs(counts) do all[ip] = true end
+for ip in pairs(totals) do all[ip] = true end
+for ip in pairs(all) do
+	local n = counts[ip] or 0
+	local tot = totals[ip] or 0
+	local hit = (n >= per_min) or (total_hits > 0 and tot >= total_hits)
+	if hit and not whitelist[ip] and not manual[ip] and not auto[ip] and not skip[ip] then
+		local is4 = ip:match("^%d+%.%d+%.%d+%.%d+$")
+		if is4 and not is_private(ip) then
+			auto[ip] = (expire and expire > 0) and (now + expire * 3600) or 0
+			added = added + 1
+			os.execute("ipset add wol_bl4 '" .. ip .. "' -exist 2>/dev/null")
+			local why = (n >= per_min) and (n .. " 次/分钟") or ("总 " .. tot .. " 次")
+			local lf = io.open(LOG, "a")
+			if lf then
+				lf:write(os.date("%Y-%m-%d %H:%M:%S") ..
+					"  自动黑名单 " .. ip .. "（" .. why .. "）\n")
+				lf:close()
+			end
+		end
+	end
+end
+
+-- 写回自动名单
+if added > 0 or removed > 0 then
+	local tmp = AUTO .. ".tmp"
+	local wf = io.open(tmp, "w")
+	if wf then
+		local keys = {}
+		for ip in pairs(auto) do keys[#keys + 1] = ip end
+		table.sort(keys)
+		for _, ip in ipairs(keys) do
+			wf:write(ip .. "\t" .. auto[ip] .. "\n")
+		end
+		wf:close()
+		os.rename(tmp, AUTO)
+	end
+	-- 同步到统一黑名单文件：保留 manual，auto 以本次结果为准
+	local BL = "/etc/wol-autowake/blacklist.list"
+	if io.open(BL, "r") then
+		local bt = BL .. ".tmp"
+		local bw = io.open(bt, "w")
+		if bw then
+			local bf = io.open(BL, "r")
+			for line in bf:lines() do
+				local bip, bexp, bsrc = line:match("^([^\t]+)\t(%d+)\t(.*)$")
+				if bip and bsrc == "manual" then
+					bw:write(bip, "\t", bexp, "\tmanual\n")
+				end
+			end
+			bf:close()
+			for ip, exp in pairs(auto) do
+				bw:write(ip, "\t", exp, "\tauto\n")
+			end
+			bw:close()
+			os.rename(bt, BL)
+		end
+	end
+	if fw then
+		os.execute("/usr/bin/wol-blfw >/dev/null 2>&1")
+	end
+	if added > 0 then
+		os.execute("/etc/init.d/wol-autowake restart >/dev/null 2>&1")
+	end
+end

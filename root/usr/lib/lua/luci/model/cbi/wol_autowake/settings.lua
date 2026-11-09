@@ -22,9 +22,4 @@ o.default = "60"
 o.rmempty = false
 o.description = translate("同一台设备在这个时间内只唤醒一次，避免连续连接请求导致重复发包")
 
-o = s:option(Flag, "logread", translate("监听防火墙日志"))
-o.default = "1"
-o.rmempty = false
-o.description = translate("这是自动唤醒的触发来源。关闭后服务会退出，只剩手动唤醒")
-
 return m

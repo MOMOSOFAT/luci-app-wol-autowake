@@ -32,6 +32,8 @@ do_wake() {
 	if etherwake -b -i "$IFACE" "$mac" >/dev/null 2>&1; then
 		echo "OK 魔术包已发送"
 		logger -t wol-wake "手动唤醒 $name ($mac)"
+		printf '%s  唤醒 [%s] 手动唤醒 端口=- 来源=\n' \
+			"$(date '+%Y-%m-%d %H:%M:%S')" "$name" >> /root/wol-autowake.log 2>/dev/null
 		return 0
 	fi
 	echo "FAIL 发送失败（装一下 etherwake）"

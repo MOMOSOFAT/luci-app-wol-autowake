@@ -121,6 +121,57 @@ find_section() {
 	config_foreach _find_match device
 }
 
+# ------------------------------------------------------------------ 本地归属地库
+GEO_DB=/etc/wol-autowake/ip2region.db
+GEO_URL1="https://gitee.com/hubo/ip2region/raw/v1.9.0/data/ip2region.db"
+GEO_URL2="https://raw.githubusercontent.com/lionsoul2014/ip2region/v1.9.0/data/ip2region.db"
+
+# 返回 need / skip:原因
+geo_need() {
+	local src pre size
+	src=$(uci -q get wol_autowake.settings.geo_source 2>/dev/null)
+	pre=$(uci -q get wol_autowake.settings.geo_precise 2>/dev/null)
+	[ "$src" = "local" ] && [ "$pre" = "1" ] || { echo "skip:未启用本地精确查询"; return 1; }
+	[ -s "$GEO_DB" ] || { echo "need"; return 0; }
+	size=$(wc -c < "$GEO_DB" 2>/dev/null || echo 0)
+	[ "${size:-0}" -ge 5000000 ] || { echo "need"; return 0; }
+	echo "skip:本地库已存在"
+	return 1
+}
+
+geo_download() {
+	local tmp size
+	mkdir -p /etc/wol-autowake
+	tmp="$GEO_DB.tmp"
+	rm -f "$tmp"
+
+	if ! curl -fsSL --max-time 180 -o "$tmp" "$GEO_URL1" 2>/dev/null; then
+		curl -fsSL --max-time 300 -o "$tmp" "$GEO_URL2" 2>/dev/null || {
+			rm -f "$tmp"
+			echo "下载失败：本地库源不可达（Gitee / GitHub 都失败）"
+			return 1
+		}
+	fi
+
+	size=$(wc -c < "$tmp" 2>/dev/null || echo 0)
+	if [ "${size:-0}" -lt 5000000 ]; then
+		rm -f "$tmp"
+		echo "下载失败：文件不完整（${size:-0} 字节，应约 7MB）"
+		return 1
+	fi
+
+	mv "$tmp" "$GEO_DB" || {
+		rm -f "$tmp"
+		echo "下载失败：无法写入 $GEO_DB"
+		return 1
+	}
+	rm -f /root/wol-geo.cache /root/wol-geo.stamp
+	echo "local-precise" > /root/wol-geo.mode
+	/usr/bin/wol-geo >/dev/null 2>&1
+	echo "本地库下载完成（$((size / 1024 / 1024)) MB），归属地已更新"
+	return 0
+}
+
 # ------------------------------------------------------------------ 分发
 case "$q" in
 	restart)
@@ -145,6 +196,16 @@ case "$q" in
 		emit true "${out:-日志清理已执行}"
 		;;
 
+	logbackup)
+		ts=$(date '+%Y%m%d-%H%M%S')
+		dst="/root/wol-autowake.log.bak-$ts"
+		if [ -s /root/wol-autowake.log ] && cp /root/wol-autowake.log "$dst" 2>/dev/null; then
+			emit true "日志已备份到 $dst"
+		else
+			emit false "日志备份失败（日志为空或无法写入）"
+		fi
+		;;
+
 	# ---- 重建 / 查看国内 IP 表 ----
 	cnlist)
 		out=$(/usr/bin/wol-cnlist build 2>&1)
@@ -156,7 +217,80 @@ case "$q" in
 		emit true "$out"
 		;;
 
+	# ---- 本地归属地库 ----
+	# ---- 单个 IP 归属地查询 ----
+	geo:*)
+		ip=${q#geo:}
+		case "$ip" in
+			''|*[!0-9a-fA-F:./]*) emit false "IP 格式不对"; exit 0 ;;
+		esac
+		text=""
+		if [ -f /etc/wol-autowake/ip2region.db ] && [ -x /usr/bin/wol-geo-lookup ]; then
+			region=$(printf '%s\n' "$ip" | /usr/bin/wol-geo-lookup /etc/wol-autowake/ip2region.db 2>/dev/null | cut -f2)
+			if [ -n "$region" ]; then
+				country=${region%%|*}; rest=${region#*|}
+				province=${rest%%|*}; rest=${rest#*|}
+				city=${rest%%|*}
+				text="$country"
+				[ -n "$province" ] && [ "$province" != "$country" ] && text="$text $province"
+				[ -n "$city" ] && [ "$city" != "$province" ] && text="$text $city"
+			fi
+		fi
+		if [ -z "$text" ]; then
+			resp=$(wget -q -T 4 -O - "http://ip-api.com/json/$ip?lang=zh-CN&fields=status,country,regionName,city" 2>/dev/null)
+			if [ -n "$resp" ]; then
+				status=$(printf '%s' "$resp" | jsonfilter -e '@.status' 2>/dev/null)
+				if [ "$status" = "success" ]; then
+					country=$(printf '%s' "$resp" | jsonfilter -e '@.country' 2>/dev/null)
+					province=$(printf '%s' "$resp" | jsonfilter -e '@.regionName' 2>/dev/null)
+					city=$(printf '%s' "$resp" | jsonfilter -e '@.city' 2>/dev/null)
+					text="$country"
+					[ -n "$province" ] && [ "$province" != "$country" ] && text="$text $province"
+					[ -n "$city" ] && [ "$city" != "$province" ] && text="$text $city"
+				fi
+			fi
+		fi
+		[ -z "$text" ] && text="未知"
+		printf '%s\t%s\t%s\n' "$ip" "$(date +%s)" "$text" >> /root/wol-geo.cache 2>/dev/null
+		emit true "$text"
+		;;
+
+	geodl:check)
+		out=$(geo_need)
+		emit true "$out"
+		;;
+
+	geodl:force)
+		out=$(geo_download); st=$?
+		[ "$st" = "0" ] && emit true "$out" || emit false "$out"
+		;;
+
+	geodl)
+		out=$(geo_need)
+		if [ "$out" != "need" ]; then
+			emit true "$out"
+			exit 0
+		fi
+		out=$(geo_download); st=$?
+		[ "$st" = "0" ] && emit true "$out" || emit false "$out"
+		;;
+
 	# ---- 手动黑名单 ----
+	setblacklist:*)
+		val=${q#setblacklist:}
+		BL_FILE=/etc/wol-autowake/blacklist.list
+		AUTO_FILE=/etc/wol-autowake/autoblack.list
+		mkdir -p /etc/wol-autowake
+		printf '%s' "$val" | tr ';' '\n' | while IFS='|' read -r ip exp src; do
+			[ -n "$ip" ] || continue
+			case "$exp" in ''|*[!0-9]*) exp=0 ;; esac
+			case "$src" in auto|manual) ;; *) src=manual ;; esac
+			printf '%s\t%s\t%s\n' "$ip" "$exp" "$src"
+		done > "$BL_FILE.tmp" && mv "$BL_FILE.tmp" "$BL_FILE"
+		awk -F'\t' '$3 == "auto" { print $1 "\t" $2 }' "$BL_FILE" > "$AUTO_FILE" 2>/dev/null
+		emit true "已保存黑名单"
+		;;
+
 	block:*)
 		ip=${q#block:}
 		[ -n "$ip" ] || { emit false "缺少 IP"; exit 0; }
@@ -166,17 +300,81 @@ case "$q" in
 		esac
 		uci set "wol_autowake.settings.blacklist=$cur $ip"
 		uci commit wol_autowake
+		BL_FILE=/etc/wol-autowake/blacklist.list
+		mkdir -p /etc/wol-autowake
+		awk -F'\t' -v ip="$ip" '$1 != ip' "$BL_FILE" > "$BL_FILE.tmp" 2>/dev/null
+		printf '%s\t0\tmanual\n' "$ip" >> "$BL_FILE.tmp"
+		mv "$BL_FILE.tmp" "$BL_FILE"
 		/etc/init.d/wol-autowake restart >/dev/null 2>&1
 		emit true "已把 $ip 加入黑名单并重启服务"
+		;;
+
+	setlist:*)
+		arg=${q#setlist:}
+		key=${arg%%:*}
+		val=${arg#*:}
+		case "$key" in
+			whitelist|blacklist) ;;
+			*) emit false "未知名单类型"; exit 0 ;;
+		esac
+		uci set "wol_autowake.settings.$key=$val"
+		uci commit wol_autowake
+		emit true "已保存 $key"
 		;;
 
 	unblock:*)
 		ip=${q#unblock:}
 		[ -n "$ip" ] || { emit false "缺少 IP"; exit 0; }
+		changed=0
+
+		# 手动黑名单：在才删
 		cur=$(uci -q get wol_autowake.settings.blacklist)
-		new=$(printf '%s' "$cur" | tr ' ,;' '\n\n\n' | grep -vxF "$ip" | tr '\n' ' ')
-		uci set "wol_autowake.settings.blacklist=$new"
-		uci commit wol_autowake
+		case " $cur " in
+			*" $ip "*)
+				new=$(printf '%s' "$cur" | tr ' ,;' '\n\n\n' | grep -vxF "$ip" | tr '\n' ' ')
+				uci set "wol_autowake.settings.blacklist=$new"
+				uci commit wol_autowake
+				changed=1
+				;;
+		esac
+
+		# 自动黑名单：在才删
+		if [ -f /etc/wol-autowake/autoblack.list ] \
+			&& awk -F'\t' -v ip="$ip" '$1 == ip { found=1 } END { exit !found }' /etc/wol-autowake/autoblack.list; then
+			awk -F'\t' -v ip="$ip" '$1 != ip' /etc/wol-autowake/autoblack.list \
+				> /etc/wol-autowake/autoblack.list.tmp 2>/dev/null \
+				&& mv /etc/wol-autowake/autoblack.list.tmp /etc/wol-autowake/autoblack.list
+			changed=1
+		fi
+
+		# 统一黑名单文件里也要删
+		BL_FILE=/etc/wol-autowake/blacklist.list
+		if [ -f "$BL_FILE" ] \
+			&& awk -F'\t' -v ip="$ip" '$1 == ip { found=1 } END { exit !found }' "$BL_FILE"; then
+			awk -F'\t' -v ip="$ip" '$1 != ip' "$BL_FILE" > "$BL_FILE.tmp" 2>/dev/null \
+				&& mv "$BL_FILE.tmp" "$BL_FILE"
+			changed=1
+		fi
+
+		# ipset 里还有残留（旧预设/旧条目）：重启后按手动+自动重建
+		if ipset test wol_bl4 "$ip" >/dev/null 2>&1; then
+			changed=1
+		fi
+
+		if [ "$changed" = "0" ]; then
+			emit true "$ip 不在黑名单，跳过"
+			exit 0
+		fi
+
+		# 24 小时内不要再自动加回来（窗口内次数还高，否则下一分钟又被加进去）
+		mkdir -p /etc/wol-autowake
+		SKIP=/etc/wol-autowake/autoblack.skip
+		if [ -f "$SKIP" ]; then
+			awk -F'\t' -v ip="$ip" '$1 != ip' "$SKIP" > "$SKIP.tmp" 2>/dev/null \
+				&& mv "$SKIP.tmp" "$SKIP"
+		fi
+		printf '%s\t%s\n' "$ip" "$(( $(date +%s) + 86400 ))" >> "$SKIP"
+
 		/etc/init.d/wol-autowake restart >/dev/null 2>&1
 		emit true "已把 $ip 从黑名单移除并重启服务"
 		;;

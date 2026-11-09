@@ -17,7 +17,6 @@
 
 IFACE="br-lan"
 THROTTLE="60"
-DO_LOGREAD="1"
 STATE_DIR="/tmp"
 
 LOG_FILE="/root/wol-autowake.log"
@@ -111,9 +110,11 @@ check_dev() {
 		WL_HIT=1
 	fi
 
-	# ① 手动黑名单（优先级最高，配了就一直生效，不受其他开关影响）
+	# ① 黑名单（手动/自动，配了就一直生效，不受其他开关影响）
 	if [ "$WL_HIT" = "0" ] && [ "$BL_OK" = "1" ] && [ -n "$src" ] && in_blacklist "$src"; then
-		plog "忽略 [$name] 来源=$src（在手动黑名单中）"
+		blsrc=manual
+		awk -F'\t' -v ip="$src" '$1 == ip && $3 == "auto" { found=1 } END { exit !found }' "$BL_FILE" 2>/dev/null && blsrc=auto
+		plog "忽略 [$name] 来源=$src（在${blsrc}黑名单中）"
 		return 0
 	fi
 
@@ -182,7 +183,6 @@ done
 config_load wol_autowake
 config_get IFACE settings iface "br-lan"
 config_get THROTTLE settings throttle "60"
-config_get_bool DO_LOGREAD settings logread 1
 
 # 来源过滤
 config_get_bool IGNORE_FOREIGN settings ignore_foreign 0
@@ -200,10 +200,7 @@ DEVCOUNT=0
 count_dev() { DEVCOUNT=$((DEVCOUNT + 1)); }
 config_foreach count_dev device
 
-# ---- 国内常见扫描器网段预设（可在设置里关掉）----
-#   都是日志里实证过的扫描/爆破来源，按 /24 粒度收窄，尽量不误伤普通宽带用户。
-#   注意：如果你自己远程访问时用的是云服务器出口，可能会被这些段挡住 ——
-#         那就把这个开关关掉，或者把具体 IP 从黑名单里删掉。
+# ---- 国内扫描器预设：单独一个黑名单 ipset，不和手动/自动混在一起 ----
 BLACKLIST_PRESET="
 47.111.94.0/24 139.224.0.0/24 47.96.0.0/24 47.98.0.0/24
 106.14.0.0/24 120.24.0.0/24 116.62.0.0/24 121.40.0.0/24
@@ -212,12 +209,52 @@ BLACKLIST_PRESET="
 49.232.0.0/24 122.152.0.0/24 140.143.0.0/24 175.24.0.0/24
 "
 
-# ---- 黑名单：手动 + （可选）国内扫描器预设，命中即忽略（优先级最高）----
-build_blacklist() {
-	local all="$BLACKLIST"
-	if [ "$BL_PRESET" = "1" ]; then
-		all="$all $BLACKLIST_PRESET"
+build_preset() {
+	if [ "$BL_PRESET" != "1" ]; then
+		ipset destroy wol_bl4_preset 2>/dev/null
+		return 0
 	fi
+	command -v ipset >/dev/null 2>&1 || return 1
+	ipset destroy wol_bl4_preset 2>/dev/null
+	ipset create wol_bl4_preset hash:net family inet hashsize 1024 maxelem 8192 2>/dev/null || return 1
+	printf '%s\n' "$BLACKLIST_PRESET" | tr ' ,;' '\n\n\n' \
+		| sed -e 's/[[:space:]]//g' \
+		| grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$' \
+		| sed 's/^/add wol_bl4_preset /' > /tmp/wol-bl4p.restore 2>/dev/null
+	[ -s /tmp/wol-bl4p.restore ] && ipset restore -exist < /tmp/wol-bl4p.restore 2>/dev/null
+	rm -f /tmp/wol-bl4p.restore
+	local n
+	n=$(ipset list wol_bl4_preset 2>/dev/null | sed -n 's/^Number of entries: //p')
+	logi "预设黑名单已加载: ${n:-0} 条"
+	return 0
+}
+
+# ---- 黑名单：统一文件 IP<TAB>过期时间<TAB>来源 ----
+BL_FILE="/etc/wol-autowake/blacklist.list"
+TAB=$(printf '\t')
+
+migrate_blacklist() {
+	[ -f "$BL_FILE" ] && return 0
+	mkdir -p /etc/wol-autowake 2>/dev/null
+	: > "$BL_FILE" 2>/dev/null || return 1
+	local ip exp
+	for ip in $BLACKLIST; do
+		printf '%s\t0\tmanual\n' "$ip" >> "$BL_FILE"
+	done
+	if [ -s /etc/wol-autowake/autoblack.list ]; then
+		while IFS="$TAB" read -r ip exp; do
+			[ -n "$ip" ] || continue
+			printf '%s\t%s\tauto\n' "$ip" "${exp:-0}" >> "$BL_FILE"
+		done < /etc/wol-autowake/autoblack.list
+	fi
+	return 0
+}
+
+build_blacklist() {
+	migrate_blacklist
+	local all
+	all=$(awk -F'\t' -v now="$(date +%s)" '$2 == 0 || $2 > now { print $1 }' \
+		"$BL_FILE" 2>/dev/null | tr '\n' ' ')
 
 	[ -n "$(printf '%s' "$all" | tr -d ' \t\n')" ] || {
 		ipset destroy wol_bl4 2>/dev/null
@@ -238,11 +275,7 @@ build_blacklist() {
 
 	local n
 	n=$(ipset list wol_bl4 2>/dev/null | sed -n 's/^Number of entries: //p')
-	if [ "$BL_PRESET" = "1" ]; then
-		logi "黑名单已加载: ${n:-0} 条（含国内扫描器预设）"
-	else
-		logi "黑名单已加载: ${n:-0} 条（仅手动）"
-	fi
+	logi "黑名单已加载: ${n:-0} 条"
 	return 0
 }
 
@@ -250,7 +283,8 @@ build_blacklist() {
 in_blacklist() {
 	local ip="$1"
 	[ -n "$ip" ] || return 1
-	ipset test wol_bl4 "$ip" >/dev/null 2>&1
+	ipset test wol_bl4 "$ip" >/dev/null 2>&1 || \
+		ipset test wol_bl4_preset "$ip" >/dev/null 2>&1
 }
 
 # ---- 白名单：命中就无条件唤醒，跳过所有过滤（优先级最高）----
@@ -305,8 +339,9 @@ if [ "$IGNORE_FOREIGN" = "1" ]; then
 fi
 
 # 黑名单独立于"忽略国外"开关：配了就一直生效；清空了要把旧集合删掉
-#   （预设黑名单也算"配了"，所以只要 BL_PRESET=1 就要建）
-if [ -n "$BLACKLIST" ] || [ "$BL_PRESET" = "1" ]; then
+#   统一黑名单文件有内容时建表
+migrate_blacklist
+if [ -s "$BL_FILE" ]; then
 	build_blacklist && BL_OK=1
 	if [ "$BL_OK" != "1" ]; then
 		logi "警告: 黑名单配置了但加载失败（检查格式，或 ipset 不可用）"
@@ -315,6 +350,16 @@ else
 	# 黑名单被清空 -> 删除旧集合，避免残留的条目继续生效
 	ipset destroy wol_bl4 2>/dev/null
 fi
+
+# 扫描器预设：单独黑名单
+if [ "$BL_PRESET" = "1" ]; then
+	build_preset
+else
+	ipset destroy wol_bl4_preset 2>/dev/null
+fi
+
+# 黑名单同步到 fw4（设置项关闭时只是清掉旧规则）
+[ -x /usr/bin/wol-blfw ] && /usr/bin/wol-blfw >/dev/null 2>&1
 
 # 白名单：配了才建，清空就删
 if [ -n "$WHITELIST" ]; then
@@ -341,11 +386,6 @@ log "在线状态扫描已启动（每 ${SCAN_SEC} 秒，模式=${SCAN_MODE}）"
 logi "服务启动: 接口=$IFACE 节流=${THROTTLE}s 设备数=$DEVCOUNT 扫描模式=$SCAN_MODE 扫描间隔=${SCAN_SEC}s"
 if [ "$IGNORE_FOREIGN" = "1" ] || [ "$IGNORE_IPV6" = "1" ]; then
 	logi "来源过滤: 忽略国外=$([ "$IGNORE_FOREIGN" = "1" ] && echo 开 || echo 关)($( [ "$CN_OK" = "1" ] && echo 就绪 || echo 未就绪 )) 忽略IPv6=$([ "$IGNORE_IPV6" = "1" ] && echo 开 || echo 关)"
-fi
-
-if [ "$DO_LOGREAD" != "1" ]; then
-	logi "配置中已关闭日志监听，退出（只剩手动唤醒）"
-	exit 0
 fi
 
 if ! command -v etherwake >/dev/null 2>&1; then

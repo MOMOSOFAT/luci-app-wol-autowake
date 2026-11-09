@@ -108,8 +108,10 @@ if [ "$HAS_MKPKG" = 1 ] && [ "$NO_APK" = 0 ]; then
 
 	# 权限
 	chmod 755 "$STAGE/etc/init.d/wol-autowake" "$STAGE/usr/bin/wol-wake" "$STAGE/usr/bin/wol-status" \
+		"$STAGE/usr/bin/wol-geo" "$STAGE/usr/bin/wol-geo-lookup" \
+		"$STAGE/usr/bin/wol-autoblock" "$STAGE/usr/bin/wol-blfw" \
 		"$STAGE/usr/libexec/wol-autowake.sh" \
-		"$STAGE/www/cgi-bin/wol-status" "$STAGE/www/cgi-bin/wol-ctl" 2>/dev/null
+		"$STAGE/www/cgi-bin/wol-status" "$STAGE/www/cgi-bin/wol-ctl" "$STAGE/www/cgi-bin/wol-log" 2>/dev/null
 
 	# ---- 包内元数据（严格照 OpenWrt include/package-pack.mk 的约定）----
 	mkdir -p "$STAGE/lib/apk/packages"
@@ -131,20 +133,23 @@ if [ "$HAS_MKPKG" = 1 ] && [ "$NO_APK" = 0 ]; then
 	# maintainer 脚本
 	cat > "$SCRIPTS/post-install" <<'EOS'
 #!/bin/sh
-chmod 755 /etc/init.d/wol-autowake /usr/bin/wol-wake /usr/bin/wol-status /usr/bin/wol-logclean /usr/bin/wol-online-scan /usr/libexec/wol-autowake.sh 2>/dev/null
-chmod 755 /www/cgi-bin/wol-status /www/cgi-bin/wol-ctl 2>/dev/null
+chmod 755 /etc/init.d/wol-autowake /usr/bin/wol-wake /usr/bin/wol-status /usr/bin/wol-geo /usr/bin/wol-geo-lookup /usr/bin/wol-autoblock /usr/bin/wol-blfw /usr/bin/wol-logclean /usr/bin/wol-online-scan /usr/libexec/wol-autowake.sh 2>/dev/null
+chmod 755 /www/cgi-bin/wol-status /www/cgi-bin/wol-ctl /www/cgi-bin/wol-log 2>/dev/null
 rm -f /www/luci-static/resources/view/wol-autowake/devices.js \
       /www/luci-static/resources/view/wol-autowake/settings.js \
       /www/luci-static/resources/view/wol-autowake/status.js 2>/dev/null
 if [ -d /etc/crontabs ]; then
 	CRONF=/etc/crontabs/root
 	[ -f "$CRONF" ] || touch "$CRONF"
-	sed -i '/# WOLAUTO-LOGCLEAN/,/# WOLAUTO-END/d' "$CRONF" 2>/dev/null
+	sed -i '/^# WOLAUTO-APP --/,/^# WOLAUTO-APP-END$/d' "$CRONF" 2>/dev/null
 	echo "" >> "$CRONF"
-	echo "# WOLAUTO-LOGCLEAN -- managed by luci-app-wol-autowake" >> "$CRONF"
+	echo "# WOLAUTO-APP -- managed by luci-app-wol-autowake" >> "$CRONF"
+	echo "20 4 * * 1 /usr/bin/wol-cnlist ensure >/dev/null 2>&1" >> "$CRONF"
 	echo "* * * * * /usr/bin/wol-online-scan >/dev/null 2>&1" >> "$CRONF"
+	echo "* * * * * /usr/bin/wol-autoblock >/dev/null 2>&1" >> "$CRONF"
+	echo "*/5 * * * * /usr/bin/wol-geo >/dev/null 2>&1" >> "$CRONF"
 	echo "17 * * * * /usr/bin/wol-logclean >/dev/null 2>&1" >> "$CRONF"
-	echo "# WOLAUTO-END" >> "$CRONF"
+	echo "# WOLAUTO-APP-END" >> "$CRONF"
 	/etc/init.d/cron enable  >/dev/null 2>&1
 	/etc/init.d/cron restart >/dev/null 2>&1
 fi
@@ -252,21 +257,24 @@ if [ "$INSTALLED_BY_APK" = 0 ]; then
 	      /www/luci-static/resources/view/wol-autowake/settings.js \
 	      /www/luci-static/resources/view/wol-autowake/status.js 2>/dev/null
 
-	chmod 755 /etc/init.d/wol-autowake /usr/bin/wol-wake /usr/bin/wol-status /usr/bin/wol-logclean /usr/bin/wol-online-scan /usr/libexec/wol-autowake.sh 2>/dev/null
-	chmod 755 /www/cgi-bin/wol-status /www/cgi-bin/wol-ctl 2>/dev/null
+	chmod 755 /etc/init.d/wol-autowake /usr/bin/wol-wake /usr/bin/wol-status /usr/bin/wol-geo /usr/bin/wol-geo-lookup /usr/bin/wol-autoblock /usr/bin/wol-blfw /usr/bin/wol-logclean /usr/bin/wol-online-scan /usr/libexec/wol-autowake.sh 2>/dev/null
+	chmod 755 /www/cgi-bin/wol-status /www/cgi-bin/wol-ctl /www/cgi-bin/wol-log 2>/dev/null
 	chmod 644 /etc/config/wol_autowake /usr/share/rpcd/acl.d/luci-app-wol-autowake.json 2>/dev/null
 
 	# ---- cron 任务：① 每分钟刷一次设备在线状态（兜底）② 每小时检查日志清理 ----
 	if [ -d /etc/crontabs ]; then
 		CRONF=/etc/crontabs/root
 		[ -f "$CRONF" ] || touch "$CRONF"
-		sed -i '/# WOLAUTO-LOGCLEAN/,/# WOLAUTO-END/d' "$CRONF" 2>/dev/null
+		sed -i '/^# WOLAUTO-APP --/,/^# WOLAUTO-APP-END$/d' "$CRONF" 2>/dev/null
 		{
 			echo ""
-			echo "# WOLAUTO-LOGCLEAN -- 由 luci-app-wol-autowake 管理，请勿手改下面几行"
+			echo "# WOLAUTO-APP -- 由 luci-app-wol-autowake 管理，请勿手改下面几行"
+			echo "20 4 * * 1 /usr/bin/wol-cnlist ensure >/dev/null 2>&1"
 			echo "* * * * * /usr/bin/wol-online-scan >/dev/null 2>&1"
+			echo "* * * * * /usr/bin/wol-autoblock >/dev/null 2>&1"
+			echo "*/5 * * * * /usr/bin/wol-geo >/dev/null 2>&1"
 			echo "17 * * * * /usr/bin/wol-logclean >/dev/null 2>&1"
-			echo "# WOLAUTO-END"
+			echo "# WOLAUTO-APP-END"
 		} >> "$CRONF"
 		/etc/init.d/cron enable  >/dev/null 2>&1
 		/etc/init.d/cron restart >/dev/null 2>&1

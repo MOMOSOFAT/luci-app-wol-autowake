@@ -37,11 +37,16 @@ EXEC_FILES = {
     "etc/init.d/wol-autowake",
     "usr/bin/wol-wake",
     "usr/bin/wol-status",
+    "usr/bin/wol-geo",
+    "usr/bin/wol-geo-lookup",
+    "usr/bin/wol-autoblock",
+    "usr/bin/wol-blfw",
     "usr/bin/wol-logclean",
     "usr/bin/wol-online-scan",
     "usr/libexec/wol-autowake.sh",
     "www/cgi-bin/wol-status",
     "www/cgi-bin/wol-ctl",
+    "www/cgi-bin/wol-log",
 }
 
 
@@ -120,8 +125,8 @@ EOF
 \t\topkg install etherwake >/dev/null 2>&1 || apk add etherwake >/dev/null 2>&1
 \t}}
 
-\tchmod 755 /etc/init.d/wol-autowake /usr/bin/wol-wake /usr/bin/wol-status /usr/bin/wol-logclean /usr/bin/wol-online-scan /usr/libexec/wol-autowake.sh 2>/dev/null
-\tchmod 755 /www/cgi-bin/wol-status /www/cgi-bin/wol-ctl 2>/dev/null
+\tchmod 755 /etc/init.d/wol-autowake /usr/bin/wol-wake /usr/bin/wol-status /usr/bin/wol-geo /usr/bin/wol-geo-lookup /usr/bin/wol-autoblock /usr/bin/wol-blfw /usr/bin/wol-logclean /usr/bin/wol-online-scan /usr/libexec/wol-autowake.sh 2>/dev/null
+\tchmod 755 /www/cgi-bin/wol-status /www/cgi-bin/wol-ctl /www/cgi-bin/wol-log 2>/dev/null
 \t# 清理旧版遗留（v1.1 及以前是三页，现已合并为 main.js）
 \trm -f /www/luci-static/resources/view/wol-autowake/devices.js \\
 \t      /www/luci-static/resources/view/wol-autowake/settings.js \\
@@ -130,12 +135,15 @@ EOF
 \tif [ -d /etc/crontabs ]; then
 \t\tCRONF=/etc/crontabs/root
 \t\t[ -f "$$CRONF" ] || touch "$$CRONF"
-\t\tsed -i '/# WOLAUTO-LOGCLEAN/,/# WOLAUTO-END/d' "$$CRONF" 2>/dev/null
+\t\tsed -i '/^# WOLAUTO-APP --/,/^# WOLAUTO-APP-END$$/d' "$$CRONF" 2>/dev/null
 \t\techo "" >> "$$CRONF"
-\t\techo "# WOLAUTO-LOGCLEAN -- managed by luci-app-wol-autowake" >> "$$CRONF"
+\t\techo "# WOLAUTO-APP -- managed by luci-app-wol-autowake" >> "$$CRONF"
+\t\techo "20 4 * * 1 /usr/bin/wol-cnlist ensure >/dev/null 2>&1" >> "$$CRONF"
 \t\techo "* * * * * /usr/bin/wol-online-scan >/dev/null 2>&1" >> "$$CRONF"
+\t\techo "* * * * * /usr/bin/wol-autoblock >/dev/null 2>&1" >> "$$CRONF"
+\t\techo "*/5 * * * * /usr/bin/wol-geo >/dev/null 2>&1" >> "$$CRONF"
 \t\techo "17 * * * * /usr/bin/wol-logclean >/dev/null 2>&1" >> "$$CRONF"
-\t\techo "# WOLAUTO-END" >> "$$CRONF"
+\t\techo "# WOLAUTO-APP-END" >> "$$CRONF"
 \t\t/etc/init.d/cron enable  >/dev/null 2>&1
 \t\t/etc/init.d/cron restart >/dev/null 2>&1
 \tfi
@@ -267,7 +275,7 @@ def main():
     targz = os.path.join(HERE, "%s-%s.tar.gz" % (PKG, VERSION))
     top = PKG
     with tarfile.open(targz, "w:gz", format=tarfile.GNU_FORMAT) as tf:
-        for extra in ("install.sh", "README.md", "Makefile"):
+        for extra in ("install.sh", "README.md", "Makefile", "LICENSE"):
             p = os.path.join(HERE, extra)
             if os.path.isfile(p):
                 with open(p, "rb") as f:

@@ -1,0 +1,28 @@
+#!/usr/bin/lua
+-- ==============================================================================
+-- wol-geo-lookup -- 用 ip2region.db 批量查询 IPv4 归属地
+--
+--   从标准输入逐行读取 IP，输出: IP<TAB>国家|省|市|ISP|国家代码
+--   IPv6 / 查不到时 region 为空（由调用方回退到国内/国外判断）
+--
+--   依赖同目录的 Ip2region.lua 和 bit32.lua（Lua 5.1 兼容层）
+-- ==============================================================================
+
+package.path = "/usr/lib/wol-autowake/?.lua;" .. package.path
+
+local dbpath = arg[1]
+if not dbpath or dbpath == "" then
+	io.stderr:write("usage: wol-geo-lookup <ip2region.db>\n")
+	os.exit(1)
+end
+
+local Ip2region = require("Ip2region")
+local db = Ip2region.new(dbpath)
+
+for line in io.lines() do
+	local ip = line:match("^%s*(.-)%s*$")
+	if ip ~= "" then
+		local r = db:memorySearch(ip)
+		io.write(ip, "\t", r and r.region or "", "\n")
+	end
+end

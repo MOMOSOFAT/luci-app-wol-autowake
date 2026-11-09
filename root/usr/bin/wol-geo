@@ -1,0 +1,217 @@
+#!/bin/sh
+# ==============================================================================
+# wol-geo -- 查询来源 IP 的归属地，结果缓存给 wol-status 用
+#
+# 模式（设置 → 来源过滤）:
+#   online        在线查询：ip-api.com 批量接口，国家 / 省 / 市
+#   local         本地查询：只用 OpenClash 的国内 IP 表，输出 中国 / 国外
+#   local-precise 本地精确：用下载的 ip2region.db，离线输出 国家 / 省 / 市
+#                 （IPv4；IPv6 回退为 中国 / 国外）
+#
+# 缓存: /root/wol-geo.cache   每行: IP<TAB>时间戳<TAB>归属地
+# 模式: /root/wol-geo.mode    模式变化时自动清空缓存
+#
+# 说明: wol-status 最多每 5 分钟调用一次；没有新 IP 时秒退。
+# ==============================================================================
+
+CACHE=${WOL_GEO_CACHE:-/root/wol-geo.cache}
+MODE_FILE=${WOL_GEO_MODE_FILE:-/root/wol-geo.mode}
+LOG=${WOL_GEO_LOG:-/root/wol-autowake.log}
+DB=${WOL_GEO_DB:-/etc/wol-autowake/ip2region.db}
+LOOKUP=${WOL_GEO_LOOKUP:-/usr/bin/wol-geo-lookup}
+BATCH=100
+TAB=$(printf '\t')
+
+cleanup() {
+	rm -f /tmp/wol-geo.ips /tmp/wol-geo.todo /tmp/wol-geo.batch \
+		/tmp/wol-geo.resp /tmp/wol-geo.pairs /tmp/wol-geo.new \
+		/tmp/wol-geo.newips /tmp/wol-geo.cache.tmp
+}
+trap cleanup EXIT INT TERM
+
+# 设置里的「归属地查询」关闭时直接退出（配置项不存在时视为开启）
+GEO_ENABLED=$(uci -q get wol_autowake.settings.geo_enabled 2>/dev/null)
+[ "$GEO_ENABLED" = "0" ] && exit 0
+
+SOURCE=$(uci -q get wol_autowake.settings.geo_source 2>/dev/null)
+case "$SOURCE" in local) ;; *) SOURCE=online ;; esac
+PRECISE=$(uci -q get wol_autowake.settings.geo_precise 2>/dev/null)
+[ "$PRECISE" = "1" ] || PRECISE=0
+
+MODE="$SOURCE"
+[ "$SOURCE" = "local" ] && [ "$PRECISE" = "1" ] && MODE="local-precise"
+
+# 模式变了就清空旧缓存，避免把在线省市显示成本地结果
+OLD_MODE=$(cat "$MODE_FILE" 2>/dev/null)
+if [ "$OLD_MODE" != "$MODE" ]; then
+	rm -f "$CACHE"
+	echo "$MODE" > "$MODE_FILE"
+fi
+
+[ -s "$LOG" ] || exit 0
+NOW=$(date +%s 2>/dev/null) || exit 0
+
+# 在线结果 30 天；本地数据 1 天（OpenClash 表更新后能较快跟上）
+TTL=2592000
+[ "$SOURCE" = "local" ] && TTL=86400
+
+# 1) 日志里的来源 IP，去重，排除内网 / 回环 / 链路本地
+sed -n 's/.*来源=\([0-9a-fA-F.:]*\).*/\1/p' "$LOG" 2>/dev/null \
+	| sort -u \
+	| grep -vE '^(10\.|192\.168\.|127\.|169\.254\.|172\.(1[6-9]|2[0-9]|3[01])\.|0\.|fc|fd|fe8|fe9|fea|feb)' \
+	> /tmp/wol-geo.ips
+
+[ -s /tmp/wol-geo.ips ] || exit 0
+
+# 2) 过滤掉 TTL 内已缓存的 IP
+if [ -s "$CACHE" ]; then
+	awk -F'\t' -v now="$NOW" -v ttl="$TTL" '
+		NR==FNR { ts[$1]=$2; next }
+		{ if (!($1 in ts) || (now - ts[$1]) > ttl) print $1 }
+	' "$CACHE" /tmp/wol-geo.ips > /tmp/wol-geo.todo
+else
+	cp /tmp/wol-geo.ips /tmp/wol-geo.todo
+fi
+
+head -n "$BATCH" /tmp/wol-geo.todo > /tmp/wol-geo.batch
+[ -s /tmp/wol-geo.batch ] || exit 0
+
+: > /tmp/wol-geo.new
+
+# ==============================================================================
+# 本地精确：ip2region.db（IPv4 国家/省/市；IPv6 回退国内/国外）
+# ==============================================================================
+if [ "$MODE" = "local-precise" ]; then
+	[ -s "$DB" ] || exit 0
+
+	# IPv6 回退需要 wol_cn6；集合不存在就先确保一次
+	if ! ipset list -n 2>/dev/null | grep -qx wol_cn6; then
+		/usr/bin/wol-cnlist ensure >/dev/null 2>&1
+	fi
+
+	"$LOOKUP" "$DB" < /tmp/wol-geo.batch > /tmp/wol-geo.resp 2>/dev/null
+	[ -s /tmp/wol-geo.resp ] || exit 0
+
+	HAVE4=0; ipset list -n 2>/dev/null | grep -qx wol_cn4 && HAVE4=1
+	HAVE6=0; ipset list -n 2>/dev/null | grep -qx wol_cn6 && HAVE6=1
+
+	while IFS="$TAB" read -r ip region; do
+		[ -n "$ip" ] || continue
+		geo=$(printf '%s' "$region" | awk -F'|' '{
+			out = "";
+			for (i = 1; i <= 4 && i <= NF; i++) {
+				if ($i == "" || $i == "0") continue;
+				out = out (out == "" ? "" : " ") $i;
+			}
+			print out;
+		}')
+		if [ -z "$geo" ]; then
+			case "$ip" in
+				*:*)
+					if [ "$HAVE6" = "1" ]; then
+						ipset test wol_cn6 "$ip" >/dev/null 2>&1 && geo="中国" || geo="国外"
+					fi
+					;;
+				*)
+					if [ "$HAVE4" = "1" ]; then
+						ipset test wol_cn4 "$ip" >/dev/null 2>&1 && geo="中国" || geo="国外"
+					fi
+					;;
+			esac
+		fi
+		[ -n "$geo" ] && printf '%s\t%s\t%s\n' "$ip" "$NOW" "$geo" >> /tmp/wol-geo.new
+	done < /tmp/wol-geo.resp
+
+# ==============================================================================
+# 本地普通：只用 OpenClash 的国内 IP 表 → 中国 / 国外
+# ==============================================================================
+elif [ "$MODE" = "local" ]; then
+	if ! ipset list -n 2>/dev/null | grep -qx wol_cn4 || \
+	   ! ipset list -n 2>/dev/null | grep -qx wol_cn6; then
+		/usr/bin/wol-cnlist ensure >/dev/null 2>&1
+	fi
+
+	# 没有国内 IP 表就不猜，避免把所有人标成“国外”
+	ipset list -n 2>/dev/null | grep -qx wol_cn4 || exit 0
+	HAVE6=0; ipset list -n 2>/dev/null | grep -qx wol_cn6 && HAVE6=1
+
+	while IFS= read -r ip; do
+		[ -n "$ip" ] || continue
+		case "$ip" in
+			*:*)
+				if [ "$HAVE6" = "1" ]; then
+					ipset test wol_cn6 "$ip" >/dev/null 2>&1 && geo="中国" || geo="国外"
+				else
+					continue
+				fi
+				;;
+			*)
+				ipset test wol_cn4 "$ip" >/dev/null 2>&1 && geo="中国" || geo="国外"
+				;;
+		esac
+		printf '%s\t%s\t%s\n' "$ip" "$NOW" "$geo" >> /tmp/wol-geo.new
+	done < /tmp/wol-geo.batch
+
+# ==============================================================================
+# 在线：ip-api.com 批量接口
+# ==============================================================================
+else
+	BODY=$(awk '{ printf "%s{\"query\":\"%s\"}", (NR>1 ? "," : ""), $0 }' /tmp/wol-geo.batch)
+	RESP=$(curl -sS --connect-timeout 3 --max-time 8 -X POST \
+		"http://ip-api.com/batch?fields=status,country,regionName,city&lang=zh-CN" \
+		-H "Content-Type: application/json" \
+		--data "[$BODY]" 2>/dev/null)
+
+	[ -n "$RESP" ] || exit 0
+
+	printf '%s' "$RESP" | lua -e '
+local jsonc = require "luci.jsonc"
+local d = jsonc.parse(io.read("*a"))
+if type(d) ~= "table" then os.exit(1) end
+for _, r in ipairs(d) do
+	io.write(string.format("%s|%s|%s|%s\n",
+		r.status or "", r.country or "", r.regionName or "", r.city or ""))
+end
+' > /tmp/wol-geo.resp 2>/dev/null
+
+	[ -s /tmp/wol-geo.resp ] || exit 0
+
+	awk 'NR==FNR { ip[FNR]=$0; next } { print ip[FNR] "\t" $0 }' \
+		/tmp/wol-geo.batch /tmp/wol-geo.resp > /tmp/wol-geo.pairs
+
+	while IFS="$TAB" read -r ip line; do
+		[ -n "$ip" ] || continue
+		status=${line%%|*}
+		[ "$status" = "success" ] || continue
+		rest=${line#*|}
+		country=${rest%%|*}; rest=${rest#*|}
+		region=${rest%%|*};  city=${rest#*|}
+		geo=$(printf '%s %s %s' "$country" "$region" "$city" | awk '{
+			n = split($0, a, " "); out = "";
+			for (i = 1; i <= n; i++) {
+				if (a[i] == "") continue;
+				if (index(" " out " ", " " a[i] " ")) continue;
+				out = out (out == "" ? "" : " ") a[i];
+			}
+			print out;
+		}')
+		[ -n "$geo" ] || continue
+		printf '%s\t%s\t%s\n' "$ip" "$NOW" "$geo" >> /tmp/wol-geo.new
+	done < /tmp/wol-geo.pairs
+fi
+
+# ==============================================================================
+# 合并进缓存（同一个 IP 只保留最新一条）
+# ==============================================================================
+if [ -s /tmp/wol-geo.new ]; then
+	cut -f1 /tmp/wol-geo.new | sort -u > /tmp/wol-geo.newips
+	if [ -s "$CACHE" ]; then
+		grep -v -F -f /tmp/wol-geo.newips "$CACHE" > /tmp/wol-geo.cache.tmp 2>/dev/null || true
+	else
+		: > /tmp/wol-geo.cache.tmp
+	fi
+	cat /tmp/wol-geo.new >> /tmp/wol-geo.cache.tmp
+	mv /tmp/wol-geo.cache.tmp "$CACHE"
+fi
+
+exit 0

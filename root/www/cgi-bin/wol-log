@@ -1,0 +1,18 @@
+#!/bin/sh
+# ==============================================================================
+# wol-log (CGI) -- 导出自动唤醒日志
+#   GET /cgi-bin/wol-log  -> text/plain 附件
+# ==============================================================================
+
+echo "Content-Type: text/plain; charset=utf-8"
+echo "Content-Disposition: attachment; filename=\"wol-autowake.log\""
+echo "Cache-Control: no-store"
+echo ""
+
+case "${REMOTE_ADDR:-}" in
+	127.*|::1|10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*|100.*|fd*|fe80*) ;;
+	*) printf 'forbidden\n'; exit 0 ;;
+esac
+
+[ -f /root/wol-autowake.log ] && cat /root/wol-autowake.log
+exit 0

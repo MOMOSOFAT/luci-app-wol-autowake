@@ -26,12 +26,29 @@ var STATUS_URL = '/cgi-bin/wol-status';
 var CTL_URL    = '/cgi-bin/wol-ctl';
 var POLL_SEC   = 10;
 
+/* 所有信息弹窗 5 秒后自动淡出 */
+var _addNotification = ui.addNotification.bind(ui);
+ui.addNotification = function () {
+	var msg = _addNotification.apply(ui, arguments);
+	if (msg) {
+		setTimeout(function () {
+			if (!msg.parentNode) return;
+			msg.classList.add('fade-out');
+			msg.classList.remove('fade-in');
+			setTimeout(function () {
+				if (msg.parentNode) msg.parentNode.removeChild(msg);
+			}, 250);
+		}, 5000);
+	}
+	return msg;
+};
+
 /* ==================================================================
  * ① 请求层
  * ================================================================== */
 var api = {
-	status: function () {
-		return fetch(STATUS_URL, { cache: 'no-store' })
+	status: function (fresh) {
+		return fetch(STATUS_URL + (fresh ? '?fresh=1' : ''), { cache: 'no-store' })
 			.then(function (r) { return r.json(); })
 			.catch(function (e) { return { error: String(e) }; });
 	},
@@ -175,8 +192,21 @@ var GLOBAL_FIELDS = [
 	  datatype: 'uinteger', required: true,
 	  desc: _('离线设备每轮都查，只有在线设备按这个间隔复查') },
 
-	{ key: 'logread', type: 'Flag', title: _('监听防火墙日志'), def: '1', required: true,
-	  desc: _('自动唤醒的触发来源，关闭后只剩手动唤醒') },
+	{ key: 'geo_enabled', type: 'Flag', title: _('归属地查询'), def: '1', required: true,
+	  desc: _('查询来源 IP 的国家 / 省 / 市，显示在「最近唤醒记录」和「可疑来源 IP」里。' +
+		'关闭后不再联网查询，也不显示已缓存的归属地。') },
+
+	{ key: 'geo_source', type: 'ListValue', title: _('归属地查询方式'), def: 'online',
+	  values: [
+		['online', _('在线查询（国家 / 省 / 市）')],
+		['local',  _('本地查询（不联网）')]
+	  ],
+	  desc: _('在线查询用 ip-api.com；本地查询默认只判断国内 / 国外。' +
+		'勾选下面的「本地精确查询」并下载本地库后，可离线显示国家 / 省 / 市。') },
+
+	{ key: 'geo_precise', type: 'Flag', title: _('本地精确查询'), def: '0',
+	  depends: ['geo_source', 'local'],
+	  desc: _('需要下载约 7MB 的 ip2region 本地库；只覆盖 IPv4，IPv6 只能判断国内 / 国外。') },
 
 	{ key: 'ignore_foreign', type: 'Flag', title: _('忽略国外 IP'), def: '0', required: true,
 	  desc: _('只唤醒中国大陆来源，国外来源只记日志') },
@@ -195,13 +225,25 @@ var GLOBAL_FIELDS = [
 	{ key: 'blacklist_preset', type: 'Flag', title: _('使用国内扫描器预设黑名单'), def: '1', required: true,
 	  desc: _('内置 18 段常见扫描器网段。如果你自己用云主机远程，可能会被挡') },
 
-	{ key: 'whitelist', type: 'TextValue', title: _('白名单（一定唤醒）'), def: '',
-	  rows: 3, placeholder: '203.0.113.10',
-	  desc: _('无条件唤醒，优先级最高') },
+	{ key: 'autobl_enabled', type: 'Flag', title: _('启用自动黑名单'), def: '1', required: true,
+	  desc: _('同一来源每分钟忽略次数或累计忽略次数达到阈值时，自动加入黑名单。' +
+		'只对白名单以外的外网 IPv4 生效。') },
 
-	{ key: 'blacklist', type: 'TextValue', title: _('手动黑名单'), def: '',
-	  rows: 3, placeholder: '198.51.100.20',
-	  desc: _('一律不唤醒') }
+	{ key: 'autobl_per_min', type: 'Value', title: _('每分钟忽略次数'), def: '20',
+	  datatype: 'uinteger', required: true,
+	  desc: _('同一来源一分钟内被忽略达到这个次数就自动加入黑名单') },
+
+	{ key: 'autobl_total', type: 'Value', title: _('总忽略次数'), def: '100',
+	  datatype: 'uinteger', required: false,
+	  desc: _('同一来源累计被忽略达到这个次数也加入黑名单；0 或留空表示不启用') },
+
+	{ key: 'autobl_expire', type: 'Value', title: _('自动解封（小时）'), def: '',
+	  datatype: 'uinteger', required: false,
+	  desc: _('自动加入的条目到期后移除；留空或填 0 表示永久，只能手动解封') },
+
+	{ key: 'blacklist_fw', type: 'Flag', title: _('黑名单加入防火墙规则'), def: '0', required: true,
+	  desc: _('开启后把黑名单 IPv4 同时写入防火墙：WAN 入站和端口转发都 DROP。' +
+		'关闭则只忽略唤醒，不拦截连接。') }
 ];
 
 var LOGCLEAN_FIELDS = [
@@ -259,10 +301,524 @@ function addField(section, def) {
 	return o;
 }
 
+/*
+ * 高级设置里的字段仍然写回 wol_autowake.settings（不新增 UCI section 类型），
+ * 这样后端 config_get settings 完全不用改。
+ */
+function addAdvancedField(section, def) {
+	var o = addField(section, def);
+	if (!o) return o;
+	o.cfgvalue = function () {
+		return this.map.data.get('wol_autowake', 'settings', def.key);
+	};
+	o.write = function (section_id) {
+		var v = this.formvalue(section_id);
+		if (v != null)
+			this.map.data.set('wol_autowake', 'settings', def.key, v);
+		return Promise.resolve();
+	};
+	o.remove = function () {
+		this.map.data.set('wol_autowake', 'settings', def.key, '');
+		return Promise.resolve();
+	};
+
+	return o;
+}
+
+function parseTagList(v) {
+	var out = [], seen = {};
+	String(v || '').split(/[\s,;]+/).forEach(function (x) {
+		x = x.trim();
+		if (!x || seen[x]) return;
+		seen[x] = 1;
+		out.push(x);
+	});
+	return out;
+}
+
+/* 只读输入框：让归属地/来源/次数/过期时间也显示成原生输入框的样子 */
+function roBox(v) {
+	return E('input', {
+		type: 'text',
+		class: 'cbi-input-text wo-ro',
+		value: (v == null ? '' : String(v)),
+		readonly: 'readonly',
+		tabindex: '-1'
+	});
+}
+
+/* 填入 IP 后自动查归属地（防抖 500ms） */
+var geoLookupTimer = null;
+function lookupGeo(ip, box, onResult) {
+	if (!ip || !/^[0-9a-fA-F:.]+$/.test(ip)) return;
+	if (geoLookupTimer) clearTimeout(geoLookupTimer);
+	geoLookupTimer = setTimeout(function () {
+		api.ctl('geo:' + ip).then(function (r) {
+			if (r && r.ok && r.result) {
+				box.value = r.result;
+				if (onResult) onResult(ip, r.result);
+			}
+		});
+	}, 500);
+}
+
+/* 让字段行占满整行，减少左边标题列留下的空白 */
+function markWide(root) {
+	function apply() {
+		try {
+			var v = root.closest ? root.closest('.cbi-value') : null;
+			if (v) v.classList.add('wo-wide');
+		} catch (e) { /* 忽略 */ }
+	}
+	if (typeof requestAnimationFrame === 'function')
+		requestAnimationFrame(apply);
+	else
+		setTimeout(apply, 0);
+}
+
+/* 白名单：表格，一条一行，可增删、上下移动 */
+function renderWhitelistEditor(o, section_id, cfgvalue, st) {
+	var manual = parseTagList(cfgvalue);
+	var LIST_KEY = 'whitelist';
+	var geoMap = {}, counts = {};
+	WOL_LISTS.whitelist = manual;
+	WOL_LISTS.whitelistReady = true;
+	var hidden = E('input', {
+		type: 'hidden',
+		id: o.cbid(section_id),
+		value: manual.join(' ')
+	});
+	var tbody = E('tbody', {});
+	var table = E('table', { class: 'table cbi-section-table' }, [
+		E('colgroup', {}, [
+			E('col', { style: 'width:16%' }),
+			E('col', { style: 'width:16%' }),
+			E('col', { style: 'width:16%' }),
+			E('col', { style: 'width:16%' }),
+			E('col', { style: 'width:16%' }),
+			E('col', { style: 'width:20%' })
+		]),
+		E('thead', {}, E('tr', {}, [
+			E('th', {}, _('IP 地址')),
+			E('th', {}, _('归属地')),
+			E('th', {}, _('来源')),
+			E('th', {}, _('访问次数')),
+			E('th', {}, _('过期时间')),
+			E('th', {}, _('操作'))
+		])),
+		tbody
+	]);
+
+	function sync() {
+		hidden.value = manual.join(' ');
+	}
+
+
+	function paint() {
+		while (tbody.firstChild) tbody.removeChild(tbody.firstChild);
+		manual.forEach(function (ip, idx) {
+			var ipInput = E('input', {
+				type: 'text',
+				class: 'cbi-input-text',
+				value: ip,
+				readonly: 'readonly',
+				style: 'width:100%'
+			});
+			var geoBox = roBox(geoMap[ip] || '');
+			ipInput.addEventListener('input', function () {
+				manual[idx] = ipInput.value.trim();
+				geoBox.value = '';
+				sync();
+				lookupGeo(manual[idx], geoBox, function (ip2, text) {
+					geoMap[ip2] = text;
+				});
+			});
+			var edit = E('button', { type: 'button', class: 'btn cbi-button' }, _('编辑'));
+			edit.addEventListener('click', function (ev) {
+				ev.preventDefault();
+				ipInput.readOnly = false;
+				ipInput.focus();
+				ipInput.select();
+			});
+			var del = E('button', { type: 'button', class: 'btn cbi-button cbi-button-remove' }, _('删除'));
+			del.addEventListener('click', function (ev) {
+				ev.preventDefault();
+				manual.splice(idx, 1);
+				sync();
+				paint();
+				api.ctl('setlist:' + LIST_KEY + ':' + manual.join(' ')).then(function (r) {
+					ui.addNotification(null, E('p', {}, r.result));
+				});
+			});
+			var save = E('button', { type: 'button', class: 'btn cbi-button cbi-button-action' }, _('保存'));
+			save.addEventListener('click', function (ev) {
+				ev.preventDefault();
+				ipInput.readOnly = true;
+				sync();
+				api.ctl('setlist:' + LIST_KEY + ':' + manual.join(' ')).then(function (r) {
+					ui.addNotification(null, E('p', {}, r.result));
+				});
+			});
+			tbody.appendChild(E('tr', {}, [
+				E('td', {}, ipInput),
+				E('td', {}, geoBox),
+				E('td', {}, roBox(_('手动'))),
+				E('td', {}, roBox(counts[ip] != null ? counts[ip] : 0)),
+				E('td', {}, roBox(_('永久'))),
+				E('td', { class: 'cbi-section-table-cell nowrap wo-bl-ops' }, [edit, del, save])
+			]));
+		});
+		/* 固定保留一行空白输入框（新增用） */
+		tbody.appendChild(E('tr', { class: 'wo-bl-addrow' }, [
+			E('td', {}, input),
+			E('td', {}, blankGeo),
+			E('td', {}, roBox(_('手动'))),
+			E('td', {}, roBox('')),
+			E('td', {}, roBox(_('永久'))),
+			E('td', { class: 'cbi-section-table-cell nowrap wo-bl-ops' })
+		]));
+	}
+
+	var input = E('input', {
+		type: 'text',
+		class: 'cbi-input-text',
+		placeholder: _('IP 或 CIDR，回车添加')
+	});
+	var blankGeo = roBox('');
+	var addBtn = E('button', { type: 'button', class: 'btn cbi-button cbi-button-add' }, _('添加'));
+
+	function add() {
+		var raw = (input.value || '').trim();
+		if (!raw) return;
+		if (!/^[0-9a-fA-F:.]+(\/[0-9]{1,3})?$/.test(raw)) {
+			ui.addNotification(null, E('p', {}, _('格式不对：请输入 IPv4 / IPv6 或 CIDR')));
+			return;
+		}
+		if (manual.indexOf(raw) < 0) manual.push(raw);
+		lookupGeo(raw, blankGeo, function (ip2, text) {
+			geoMap[ip2] = text;
+			paint();
+		});
+		input.value = '';
+		blankGeo.value = '';
+		sync();
+		paint();
+		api.ctl('setlist:whitelist:' + manual.join(' ')).then(function (r) {
+			ui.addNotification(null, E('p', {}, r.result));
+		});
+		input.focus();
+	}
+
+	addBtn.addEventListener('click', function (ev) { ev.preventDefault(); add(); });
+	input.addEventListener('input', function () {
+		blankGeo.value = '';
+		lookupGeo(input.value.trim(), blankGeo, function (ip2, text) {
+			geoMap[ip2] = text;
+		});
+	});
+	input.addEventListener('keydown', function (ev) {
+		if (ev.key === 'Enter') { ev.preventDefault(); add(); }
+	});
+
+	paint();
+	sync();
+
+	if (st) {
+		geoMap = (st.geo) || {};
+		counts = {};
+		(st.seen || []).forEach(function (x) { counts[x.ip] = x.n; });
+		paint();
+	}
+
+	var root = E('div', { class: 'wo-bl-editor' }, [
+		hidden,
+		table,
+		E('div', { class: 'cbi-section-create cbi-tblsection-create' }, [addBtn])
+	]);
+	markWide(root);
+	return root;
+}
+
+function renderBlacklistEditor(o, section_id, cfgvalue, st) {
+	var manual = parseTagList(cfgvalue);
+	var manualExp = {};
+	var auto = [];
+	if (st && st.blacklist && st.blacklist.length) {
+		manual = [];
+		auto = [];
+		st.blacklist.forEach(function (e) {
+			if (e.source === 'auto') auto.push({ ip: e.ip, expire: Number(e.expire) || 0 });
+			else { manual.push(e.ip); manualExp[e.ip] = Number(e.expire) || 0; }
+		});
+	}
+	var geoMap = {}, counts = {};
+	WOL_LISTS.blacklist = manual;
+	WOL_LISTS.blacklistReady = true;
+	var hidden = E('input', {
+		type: 'hidden',
+		id: o.cbid(section_id),
+		value: manual.join(' ')
+	});
+	var tbody = E('tbody', {});
+	var table = E('table', { class: 'table cbi-section-table' }, [
+		E('colgroup', {}, [
+			E('col', { style: 'width:16%' }),
+			E('col', { style: 'width:16%' }),
+			E('col', { style: 'width:16%' }),
+			E('col', { style: 'width:16%' }),
+			E('col', { style: 'width:16%' }),
+			E('col', { style: 'width:20%' })
+		]),
+		E('thead', {}, E('tr', {}, [
+			E('th', {}, _('IP 地址')),
+			E('th', {}, _('归属地')),
+			E('th', {}, _('来源')),
+			E('th', {}, _('访问次数')),
+			E('th', {}, _('过期时间')),
+			E('th', {}, _('操作'))
+		])),
+		tbody
+	]);
+
+	function sync() {
+		hidden.value = manual.join(' ');
+	}
+
+	function fmtExpire(exp) {
+		if (!exp) return '';
+		var d = new Date(exp * 1000);
+		function p(n) { return (n < 10 ? '0' : '') + n; }
+		return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) +
+			' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+	}
+
+	function hoursOf(exp) {
+		if (!exp) return '';
+		var h = Math.round((exp - Date.now() / 1000) / 3600);
+		return h > 0 ? String(h) : '';
+	}
+
+	function saveAll() {
+		sync();
+		var lines = manual.map(function (ip) {
+			return ip + '|' + (manualExp[ip] || 0) + '|manual';
+		}).concat(auto.filter(function (it) {
+			return manual.indexOf(it.ip) < 0;
+		}).map(function (it) {
+			return it.ip + '|' + (it.expire || 0) + '|auto';
+		}));
+		return api.ctl('setblacklist:' + lines.join(';')).then(function (r) {
+			ui.addNotification(null, E('p', {}, r.result));
+		});
+	}
+
+
+	function paint() {
+		while (tbody.firstChild) tbody.removeChild(tbody.firstChild);
+
+		manual.forEach(function (ip, idx) {
+			var ipInput = E('input', {
+				type: 'text',
+				class: 'cbi-input-text',
+				value: ip,
+				readonly: 'readonly',
+				style: 'width:100%'
+			});
+			var geoBox = roBox(geoMap[ip] || '');
+			var expInput = E('input', {
+				type: 'text',
+				class: 'cbi-input-text',
+				value: fmtExpire(manualExp[ip] || 0),
+				placeholder: _('永久'),
+				readonly: 'readonly',
+				style: 'width:100%'
+			});
+			ipInput.addEventListener('input', function () {
+				manual[idx] = ipInput.value.trim();
+				geoBox.value = '';
+				sync();
+				lookupGeo(manual[idx], geoBox, function (ip2, text) {
+					geoMap[ip2] = text;
+				});
+			});
+			var edit = E('button', { type: 'button', class: 'btn cbi-button' }, _('编辑'));
+			edit.addEventListener('click', function (ev) {
+				ev.preventDefault();
+				ipInput.readOnly = false;
+				expInput.readOnly = false;
+				expInput.value = hoursOf(manualExp[ip] || 0);
+				ipInput.focus();
+				ipInput.select();
+			});
+			var del = E('button', { type: 'button', class: 'btn cbi-button cbi-button-remove' }, _('删除'));
+			del.addEventListener('click', function (ev) {
+				ev.preventDefault();
+				manual.splice(idx, 1);
+				sync();
+				paint();
+				saveAll();
+			});
+			var save = E('button', { type: 'button', class: 'btn cbi-button cbi-button-action' }, _('保存'));
+			save.addEventListener('click', function (ev) {
+				ev.preventDefault();
+				var h = Number(expInput.value);
+				if (!isFinite(h) || h < 0) h = 0;
+				manualExp[ip] = h > 0 ? Math.floor(Date.now() / 1000 + h * 3600) : 0;
+				ipInput.readOnly = true;
+				expInput.readOnly = true;
+				saveAll();
+				paint();
+			});
+			tbody.appendChild(E('tr', {}, [
+				E('td', {}, ipInput),
+				E('td', {}, geoBox),
+				E('td', {}, roBox(_('手动'))),
+				E('td', {}, roBox(counts[ip] != null ? counts[ip] : 0)),
+				E('td', {}, expInput),
+				E('td', { class: 'cbi-section-table-cell nowrap wo-bl-ops' }, [edit, del, save])
+			]));
+		});
+
+		auto.forEach(function (it, idx) {
+			if (manual.indexOf(it.ip) >= 0) return;
+			var aip = E('input', {
+				type: 'text', class: 'cbi-input-text', value: it.ip,
+				readonly: 'readonly', style: 'width:100%'
+			});
+			var ageo = roBox(geoMap[it.ip] || '');
+			var aexp = E('input', {
+				type: 'text', class: 'cbi-input-text', value: fmtExpire(it.expire),
+				placeholder: _('永久'), readonly: 'readonly', style: 'width:100%'
+			});
+			var edit = E('button', { type: 'button', class: 'btn cbi-button' }, _('编辑'));
+			edit.addEventListener('click', function (ev) {
+				ev.preventDefault();
+				aip.readOnly = false;
+				aexp.readOnly = false;
+				aexp.value = hoursOf(it.expire);
+				aip.focus();
+				aip.select();
+			});
+			var del = E('button', { type: 'button', class: 'btn cbi-button cbi-button-remove' }, _('删除'));
+			del.addEventListener('click', function (ev) {
+				ev.preventDefault();
+				auto.splice(idx, 1);
+				saveAll();
+				paint();
+			});
+			var save = E('button', { type: 'button', class: 'btn cbi-button cbi-button-action' }, _('保存'));
+			save.addEventListener('click', function (ev) {
+				ev.preventDefault();
+				var h = Number(aexp.value);
+				if (!isFinite(h) || h < 0) h = 0;
+				it.ip = aip.value.trim();
+				it.expire = h > 0 ? Math.floor(Date.now() / 1000 + h * 3600) : 0;
+				aip.readOnly = true;
+				aexp.readOnly = true;
+				saveAll();
+				paint();
+			});
+			tbody.appendChild(E('tr', {}, [
+				E('td', {}, aip),
+				E('td', {}, ageo),
+				E('td', {}, roBox(_('自动'))),
+				E('td', {}, roBox(counts[it.ip] != null ? counts[it.ip] : 0)),
+				E('td', {}, aexp),
+				E('td', { class: 'cbi-section-table-cell nowrap wo-bl-ops' }, [edit, del, save])
+			]));
+		});
+
+		/* 固定保留一行空白输入框（新增用） */
+		tbody.appendChild(E('tr', { class: 'wo-bl-addrow' }, [
+			E('td', {}, input),
+			E('td', {}, blankGeo),
+			E('td', {}, roBox(_('手动'))),
+			E('td', {}, roBox('')),
+			E('td', {}, inputExp),
+			E('td', { class: 'cbi-section-table-cell nowrap wo-bl-ops' })
+		]));
+	}
+
+	var input = E('input', {
+		type: 'text',
+		class: 'cbi-input-text',
+		placeholder: _('IP 或 CIDR，回车添加')
+	});
+	var blankGeo = roBox('');
+	var inputExp = E('input', {
+		type: 'text',
+		class: 'cbi-input-text',
+		placeholder: _('永久')
+	});
+	var addBtn = E('button', { type: 'button', class: 'btn cbi-button cbi-button-add' }, _('添加'));
+
+	function add() {
+		var raw = (input.value || '').trim();
+		if (!raw) return;
+		if (!/^[0-9a-fA-F:.]+(\/[0-9]{1,3})?$/.test(raw)) {
+			ui.addNotification(null, E('p', {}, _('格式不对：请输入 IPv4 / IPv6 或 CIDR')));
+			return;
+		}
+		if (auto.some(function (x) { return x.ip === raw; })) {
+			ui.addNotification(null, E('p', {}, _('这个 IP 已经在自动黑名单里')));
+			return;
+		}
+		if (manual.indexOf(raw) < 0) manual.push(raw);
+		var h = Number(inputExp.value);
+		if (!isFinite(h) || h < 0) h = 0;
+		manualExp[raw] = h > 0 ? Math.floor(Date.now() / 1000 + h * 3600) : 0;
+		lookupGeo(raw, blankGeo, function (ip2, text) {
+			geoMap[ip2] = text;
+			paint();
+		});
+		input.value = '';
+		blankGeo.value = '';
+		inputExp.value = '';
+		sync();
+		saveAll();
+		paint();
+		input.focus();
+	}
+
+	addBtn.addEventListener('click', function (ev) { ev.preventDefault(); add(); });
+	input.addEventListener('input', function () {
+		blankGeo.value = '';
+		lookupGeo(input.value.trim(), blankGeo, function (ip2, text) {
+			geoMap[ip2] = text;
+		});
+	});
+	input.addEventListener('keydown', function (ev) {
+		if (ev.key === 'Enter') { ev.preventDefault(); add(); }
+	});
+
+	paint();
+	sync();
+
+	if (st) {
+		if (!(st.blacklist && st.blacklist.length)) auto = (st.autobl) || [];
+		geoMap = (st.geo) || {};
+		counts = {};
+		(st.seen || []).forEach(function (x) { counts[x.ip] = x.n; });
+		paint();
+	}
+
+	var root = E('div', { class: 'wo-bl-editor' }, [
+		hidden,
+		table,
+		E('div', { class: 'cbi-section-create cbi-tblsection-create' }, [addBtn])
+	]);
+	markWide(root);
+	return root;
+}
+
 /* ==================================================================
  * ⑤ 渲染后修饰：按【列名】定位单元格，接管状态格 + 插唤醒按钮
  * ================================================================== */
 var LIVE = [];   /* [{el, port, kind}] —— 轮询时就地刷新 */
+var WOL_LISTS = window.__wolLists = window.__wolLists || {
+	whitelist: [], blacklist: [],
+	whitelistReady: false, blacklistReady: false
+};
 
 function columnIndex(table, title) {
 	var ths = table.querySelectorAll('thead th');
@@ -435,22 +991,25 @@ function decorate(formNode, onWoke) {
 		}
 
 		/* 状态标签：ok 绿色 / 否则灰色 */
-		function pill(ok, text) {
+		function pill(ok, text, tone) {
+			var tones = {
+				ok:   ['rgba(10,150,60,.12)',  '#0a7a3a', 'rgba(10,150,60,.30)'],
+				info: ['rgba(43,108,176,.12)', '#2b6cb0', 'rgba(43,108,176,.30)'],
+				warn: ['rgba(190,120,0,.14)',  '#a86400', 'rgba(190,120,0,.30)'],
+				bad:  ['rgba(200,0,0,.10)',    '#c00',    'rgba(200,0,0,.28)'],
+				off:  ['rgba(128,128,128,.12)','#777',    'rgba(128,128,128,.24)']
+			};
+			var t = tone || (ok ? 'ok' : 'off');
+			var c = tones[t] || tones.off;
 			return E('span', {
-				style: 'display:inline-block;padding:1px 9px;border-radius:10px;font-size:86%;' +
-					'font-weight:600;white-space:nowrap;' +
-					(ok ? 'background:rgba(0,150,0,.14);color:#0a7a0a'
-					    : 'background:rgba(128,128,128,.16);color:#888')
-			}, text);
-		}
-
-		/* meta 行里的小标签：前面补一个间隔 */
-		function k(text) {
-			return E('span', { style: 'opacity:.5;margin-left:14px' }, text);
-		}
-
-		/* ---------------- 状态卡片 ---------------- */
-		var statusBox = E('div', { style: 'padding:4px 24px 12px' }, E('em', {}, _('正在读取状态…')));
+				class: 'wo-pill',
+				style: 'background:' + c[0] + ';color:' + c[1] + ';border-color:' + c[2]
+			}, [
+				E('span', { class: 'wo-pill-dot', style: 'background:' + c[1] }),
+				text
+			]);
+		}/* ---------------- 状态卡片 ---------------- */
+		var statusBox = E('div', { style: 'padding:0' }, E('em', {}, _('正在读取状态…')));
 
 		function paintStatus(st) {
 			Model.load(st);
@@ -500,39 +1059,36 @@ function decorate(formNode, onWoke) {
 				tile(s.total, _('设备总数')),
 				tile(s.online, _('当前在线'), s.online > 0 ? '#0a7a0a' : ''),
 				tile(Number(f.ign) || 0, _('今日忽略')),
-				tile(Number(f.woke) || 0, _('今日唤醒'), '#0a7a0a')
+				tile(Number(f.woke) || 0, _('今日唤醒'), '#0a7a0a'),
+				tile(Number(f.bl_today) || 0, _('今日黑名单'))
 			]));
 
 			/* ---- 三个状态标签 ---- */
-			var pills = E('div', { style: 'margin-bottom:12px;display:flex;gap:8px;flex-wrap:wrap' }, [
-				pill(svcOk, svcOk ? _('服务运行中') : _('服务未运行')),
-				pill(depOk, depOk ? _('etherwake 已装') : _('缺 etherwake')),
-				pill(trigOk, trigOk ? _('转发日志正常') : _('转发日志异常'))
+			var pills = E('div', { class: 'wo-pills' }, [
+				pill(svcOk, svcOk ? _('服务运行中') : _('服务未运行'), svcOk ? 'ok' : 'bad'),
+				pill(depOk, depOk ? _('etherwake 已装') : _('缺 etherwake'), depOk ? 'ok' : 'bad'),
+				pill(trigOk, trigOk ? _('转发日志正常') : _('转发日志异常'), trigOk ? 'ok' : 'warn')
 			]);
 			statusBox.appendChild(pills);
 
-			/* ---- 参数行 ---- */
-			var meta2 = E('div', { class: 'wo-meta' }, [
-				k(_('接口')), E('b', {}, s.iface),
-				k(_('节流')), E('b', {}, s.throttle + _(' 秒')),
-				k(_('日志监听')), E('b', {}, s.logread ? _('开') : _('关'))
-			]);
-			statusBox.appendChild(meta2);
-
 			/* ---- 过滤状态行 ---- */
-			var frow = E('div', { class: 'wo-meta' }, [
-				E('span', { style: 'opacity:.5;margin-left:0' }, _('过滤')),
-				pill(f.on, f.on ? _('忽略国外') : _('国外放行'))
+			var frow = E('div', { class: 'wo-filter-row' }, [
+				E('span', { class: 'wo-filter-item' }, [
+					E('span', { class: 'wo-label' }, _('过滤')),
+					pill(f.on, f.on ? _('忽略国外') : _('国外放行'), f.on ? 'ok' : 'info')
+				])
 			]);
 			if (f.on) {
-				frow.appendChild(k(_('数据')));
-				frow.appendChild(E('b', {}, (f.src === 'download' ? _('自建下载') : _('OpenClash'))
-					+ ' · ' + (Number(f.cn) || 0) + _(' 条')));
+				frow.appendChild(E('span', { class: 'wo-filter-item' }, [
+					E('span', { class: 'wo-label' }, _('数据')),
+					E('b', {}, (f.src === 'download' ? _('自建下载') : _('OpenClash'))
+						+ ' · ' + (Number(f.cn) || 0) + _(' 条'))
+				]));
 			}
-			frow.appendChild(k(_('黑名单')));
-			frow.appendChild(E('b', {}, Number(f.bl) > 0 ? _('%s 条').format(f.bl) : _('空')));
-			frow.appendChild(k(_('IPv6')));
-			frow.appendChild(pill(f.ipv6, f.ipv6 ? _('忽略') : _('放行')));
+			frow.appendChild(E('span', { class: 'wo-filter-item' }, [
+				E('span', { class: 'wo-label' }, _('IPv6')),
+				pill(f.ipv6, f.ipv6 ? _('忽略') : _('放行'), f.ipv6 ? 'ok' : 'info')
+			]));
 			statusBox.appendChild(frow);
 
 			/* ---- 目标端口说明 ---- */
@@ -591,6 +1147,7 @@ function decorate(formNode, onWoke) {
 			while (seenBox.firstChild) seenBox.removeChild(seenBox.firstChild);
 
 			var list = (src && src.seen) || [];
+			var geoMap = (src && src.geo) || {};
 			if (!list.length) {
 				seenBox.appendChild(E('em', {}, _('(日志里还没有出现过外部来源。设备关机后被外部连接一次，这里就会出现)')));
 				return;
@@ -603,14 +1160,16 @@ function decorate(formNode, onWoke) {
 			var tbody = E('tbody', {});
 			shown.forEach(function (it) {
 				var isV6 = String(it.ip).indexOf(':') >= 0;
-				var cnTxt = isV6 ? _('IPv6') : (it.cn ? _('国内') : _('国外'));
-				var cnCol = isV6 ? '#666' : (it.cn ? '#0a7a0a' : '#c00');
+				var geoText = geoMap[it.ip] || '';
+				var locTxt = geoText || (isV6 ? _('IPv6') : (it.cn ? _('国内') : _('国外')));
+				var locCol = geoText ? '#333' : (isV6 ? '#666' : (it.cn ? '#0a7a0a' : '#c00'));
 
 				var opCell;
 				if (it.bl) {
 					opCell = E('span', {}, [
 						E('span', { style: 'color:#999;margin-right:8px' }, _('已在黑名单')),
 						E('button', {
+							type: 'button',
 							class: 'cbi-button',
 							click: ui.createHandlerFn(self, function () {
 								return api.ctl('unblock:' + it.ip).then(function (r) {
@@ -622,6 +1181,7 @@ function decorate(formNode, onWoke) {
 					]);
 				} else {
 					opCell = E('button', {
+						type: 'button',
 						class: 'cbi-button cbi-button-action',
 						click: ui.createHandlerFn(self, function () {
 							return api.ctl('block:' + it.ip).then(function (r) {
@@ -633,11 +1193,11 @@ function decorate(formNode, onWoke) {
 				}
 
 				tbody.appendChild(E('tr', {}, [
-					E('td', { class: 'wo-ip' , style: 'text-align:center !important' }, it.ip),
-					E('td', { style: 'text-align:center !important' }, String(it.n)),
-					E('td', { style: 'text-align:center !important;white-space:nowrap' }, it.last || ''),
+					E('td', { style: 'text-align:center !important' }, it.last || ''),
 					E('td', { class: 'wo-dev' , style: 'text-align:center !important' }, it.dev || '-'),
-					E('td', { style: 'text-align:center !important;color:' + cnCol + ';font-weight:bold' }, cnTxt),
+					E('td', { class: 'wo-ip' , style: 'text-align:center !important' }, it.ip),
+					E('td', { style: 'text-align:center !important;font-weight:bold' + (geoText ? '' : ';color:' + locCol) }, locTxt),
+					E('td', { style: 'text-align:center !important;font-weight:bold' }, String(it.n)),
 					E('td', { style: 'text-align:center !important' }, it.kind || ''),
 					E('td', { style: 'text-align:center !important' }, opCell)
 				]));
@@ -645,20 +1205,20 @@ function decorate(formNode, onWoke) {
 
 			var tb = E('table', { class: 'table wo-seen' }, [
 				E('colgroup', {}, [
-					E('col', { style: 'width:21%' }),
-					E('col', { style: 'width:6%' }),
-					E('col', { style: 'width:19%' }),
+					E('col', { style: 'width:17%' }),
+					E('col', { style: 'width:14%' }),
+					E('col', { style: 'width:18%' }),
 					E('col', { style: 'width:17%' }),
 					E('col', { style: 'width:8%' }),
-					E('col', { style: 'width:9%' }),
-					E('col', { style: 'width:20%' })
+					E('col', { style: 'width:10%' }),
+					E('col', { style: 'width:16%' })
 				]),
 				E('thead', {}, E('tr', {}, [
-					E('th', { class: 'wo-ip' , style: 'text-align:center !important' }, _('来源 IP')),
-					E('th', { style: 'text-align:center !important' }, _('次数')),
 					E('th', { style: 'text-align:center !important' }, _('最近')),
 					E('th', { class: 'wo-dev' , style: 'text-align:center !important' }, _('设备')),
-					E('th', { style: 'text-align:center !important' }, _('归属')),
+					E('th', { class: 'wo-ip' , style: 'text-align:center !important' }, _('来源 IP')),
+					E('th', { style: 'text-align:center !important' }, _('归属地')),
+					E('th', { style: 'text-align:center !important' }, _('次数')),
 					E('th', { style: 'text-align:center !important' }, _('上次结果')),
 					E('th', { style: 'text-align:center !important' }, _('操作'))
 				])),
@@ -666,76 +1226,174 @@ function decorate(formNode, onWoke) {
 			]);
 			seenBox.appendChild(tb);
 
-			/* 折叠控制条 */
+			/* 折叠控制条：默认只列最近 10 条，其余折叠；这里明确写出总数，避免误以为“显示不全” */
 			if (list.length > LIMIT) {
-				seenBox.appendChild(E('div', { style: 'margin-top:8px;text-align:center' }, [
+				var hidden = list.length - LIMIT;
+				seenBox.appendChild(E('div', {
+					style: 'margin-top:8px;display:flex;flex-direction:column;align-items:center;gap:6px;color:#777;font-size:92%'
+				}, [
+					E('span', {}, seenExpanded
+						? _('已展开全部 %d 个可疑来源').format(list.length)
+						: _('共 %d 个可疑来源，当前显示最近 %d 个').format(list.length, LIMIT)),
 					E('button', {
 						class: 'cbi-button cbi-button-action',
+						style: 'margin:0',
 						click: ui.createHandlerFn(self, function () {
 							seenExpanded = !seenExpanded;
 							paintSeen(null);
 							return Promise.resolve();
 						})
 					}, seenExpanded
-						? _('收起（只看最近 %d 条）').format(LIMIT)
-						: _('展开全部 %d 条').format(list.length))
+						? _('收起其余 %d 个').format(hidden)
+						: _('展开其余 %d 个').format(hidden))
 				]));
 			}
 		}
 
-		/* ---------------- 最近唤醒记录（最近 10 条，含被忽略的）---------------- */
+		/* ---------------- 最近唤醒记录（成功唤醒 / 忽略记录，可切换）---------------- */
 		var evBox = E('div', {});
+		var evKind = '唤醒';          /* 当前查看：唤醒 = 成功唤醒记录，忽略 = 忽略记录 */
+		var evExpanded = false;
+		var evLast = null;
+
+		/* 来源 IP 是否属于内网 / 回环 / 链路本地 —— 用于区分“本地唤醒 / 远程唤醒” */
+		function isLocalSource(ip) {
+			return /^(10\.|192\.168\.|127\.|169\.254\.|172\.(1[6-9]|2[0-9]|3[01])\.|fc|fd|fe8|fe9|fea|feb)/.test(String(ip || ''));
+		}
 
 		function paintEvents(st) {
+			if (st) evLast = st;
 			while (evBox.firstChild) evBox.removeChild(evBox.firstChild);
 
-			var list = (st && st.events) || [];
+			var all = (evLast && evLast.events) || [];
+			var list = all.filter(function (e) { return e.kind === evKind; });
+			var geoMap = (evLast && evLast.geo) || {};
+			var blSrc = {};
+			((evLast && evLast.blacklist) || []).forEach(function (b) { blSrc[b.ip] = b.source; });
+
+			/* 同 IP + 同设备折叠成一条，只显示次数 */
+			var groups = [], gmap = {};
+			list.forEach(function (e) {
+				var key = String(e.ip) + '|' + String(e.dev);
+				if (!gmap[key]) {
+					gmap[key] = { e: e, count: 0 };
+					groups.push(gmap[key]);
+				}
+				gmap[key].count += (Number(e.n) || 1);
+			});
+			list = groups.map(function (g) {
+				g.e._count = g.count;
+				return g.e;
+			});
+
+			function switchKind(k) {
+				if (evKind === k) return;
+				evKind = k;
+				evExpanded = false;
+				paintEvents(null);
+			}
+
+			/* 切换条：成功唤醒 / 忽略记录 */
+			evBox.appendChild(E('div', {
+				style: 'margin:0 0 10px;display:flex;gap:8px;flex-wrap:wrap'
+			}, [
+				E('button', {
+					class: 'cbi-button' + (evKind === '唤醒' ? ' cbi-button-action' : ''),
+					click: ui.createHandlerFn(self, function () { switchKind('唤醒'); return Promise.resolve(); })
+				}, _('成功唤醒')),
+				E('button', {
+					class: 'cbi-button' + (evKind === '忽略' ? ' cbi-button-action' : ''),
+					click: ui.createHandlerFn(self, function () { switchKind('忽略'); return Promise.resolve(); })
+				}, _('忽略记录'))
+			]));
+
 			if (!list.length) {
-				evBox.appendChild(E('em', {}, _('(暂无记录。设备关机后被外部连接一次，这里就会出现)')));
+				evBox.appendChild(E('em', {}, evKind === '唤醒'
+					? _('(暂无成功唤醒记录)')
+					: _('(暂无忽略记录)')));
 				return;
 			}
 
+			/* 默认只显示最近 5 条，其余折叠 */
+			var LIMIT = 5;
+			var shown = evExpanded ? list : list.slice(0, LIMIT);
+
 			var tbody = E('tbody', {});
-			list.forEach(function (e) {
+			shown.forEach(function (e) {
 				var isWake = (e.kind === '唤醒');
+				var egeo = geoMap[e.ip] || '';
+				var ipText = (e.ip && e.ip !== '手动') ? e.ip : '—';
+				var whyText = e.why || '';
+				if (isWake) {
+					if (e.why === '手动唤醒') whyText = _('手动唤醒');
+					else whyText = isLocalSource(e.ip) ? _('本地唤醒') : _('远程唤醒');
+				}
+				else if (/黑名单/.test(whyText)) {
+					if (blSrc[e.ip] === 'auto') whyText = _('在自动黑名单中');
+					else if (blSrc[e.ip] === 'manual') whyText = _('在手动黑名单中');
+				}
 				tbody.appendChild(E('tr', {}, [
-					E('td', { class: 'wo-ip', style: 'text-align:center !important;white-space:nowrap' }, e.ts || ''),
-					E('td', {
-						style: 'color:' + (isWake ? '#0a7a0a' : '#999') + ';font-weight:bold'
-					}, e.kind || ''),
+					E('td', { class: 'wo-ip', style: 'text-align:center !important' }, e.ts || ''),
 					E('td', { class: 'wo-dev' , style: 'text-align:center !important' }, e.dev || ''),
+					E('td', { class: 'wo-ip' , style: 'text-align:center !important' }, ipText),
+					E('td', { class: 'wo-geo' , style: 'text-align:center !important' }, egeo || '—'),
+					E('td', { style: 'text-align:center !important;font-weight:bold' }, String(e._count || 1)),
 					E('td', { style: 'text-align:center !important' }, e.port || '-'),
-					E('td', { class: 'wo-ip' , style: 'text-align:center !important' }, (e.ip || '')),
-					E('td', { class: 'wo-dev' , style: 'text-align:center !important' }, e.why || '')
+					E('td', { class: 'wo-dev' , style: 'text-align:center !important' }, whyText)
 				]));
 			});
 
 			var evTbl = E('table', { class: 'table wo-seen' }, [
 				E('colgroup', {}, [
-					E('col', { style: 'width:19%' }),
+					E('col', { style: 'width:17%' }),
+					E('col', { style: 'width:14%' }),
+					E('col', { style: 'width:18%' }),
+					E('col', { style: 'width:17%' }),
 					E('col', { style: 'width:8%' }),
-					E('col', { style: 'width:15%' }),
-					E('col', { style: 'width:9%' }),
-					E('col', { style: 'width:26%' }),
-					E('col', { style: 'width:23%' })
+					E('col', { style: 'width:10%' }),
+					E('col', { style: 'width:16%' })
 				]),
 				E('thead', {}, E('tr', {}, [
 					E('th', { class: 'wo-ip' , style: 'text-align:center !important' }, _('时间')),
-					E('th', { style: 'text-align:center !important' }, _('结果')),
 					E('th', { class: 'wo-dev' , style: 'text-align:center !important' }, _('设备')),
-					E('th', { style: 'text-align:center !important' }, _('端口')),
 					E('th', { class: 'wo-ip' , style: 'text-align:center !important' }, _('来源 IP')),
+					E('th', { class: 'wo-geo' , style: 'text-align:center !important' }, _('归属地')),
+					E('th', { style: 'text-align:center !important' }, _('次数')),
+					E('th', { style: 'text-align:center !important' }, _('端口')),
 					E('th', { class: 'wo-dev' , style: 'text-align:center !important' }, _('说明'))
 				])),
 				tbody
 			]);
 			evBox.appendChild(evTbl);
 			forceCenter(evTbl);
+
+			/* 折叠控制条：默认最近 10 条，其余折叠 */
+			if (list.length > LIMIT) {
+				var hidden = list.length - LIMIT;
+				evBox.appendChild(E('div', {
+					style: 'margin-top:8px;display:flex;flex-direction:column;align-items:center;gap:6px;color:#777;font-size:92%'
+				}, [
+					E('span', {}, evExpanded
+						? _('已展开全部 %d 条记录').format(list.length)
+						: _('共 %d 条记录，当前显示最近 %d 条').format(list.length, LIMIT)),
+					E('button', {
+						class: 'cbi-button cbi-button-action',
+						style: 'margin:0',
+						click: ui.createHandlerFn(self, function () {
+							evExpanded = !evExpanded;
+							paintEvents(null);
+							return Promise.resolve();
+						})
+					}, evExpanded
+						? _('收起其余 %d 条').format(hidden)
+						: _('展开其余 %d 条').format(hidden))
+				]));
+			}
 		}
 
 		/* ---------------- 一次请求刷新所有 ---------------- */
-		function refreshAll() {
-			return api.status().then(function (st) {
+		function refreshAll(fresh) {
+			return api.status(fresh !== false).then(function (st) {
 				Model.load(st);
 				paintStatus(st);
 				paintSeen(st);
@@ -784,7 +1442,8 @@ function decorate(formNode, onWoke) {
 		/* ---- ② 设置（一个标签页装下全部设置项）---- */
 		s = m.section(form.TypedSection, 'settings', _('设置'));
 		s.anonymous   = true;
-		s.description = _('顺序：服务 → 扫描 → 来源过滤 → 日志清理 → 维护操作。' +
+		s.description = _('顺序：服务 → 扫描 → 来源过滤。' +
+			'白名单、黑名单在本页；日志清理和维护操作在「高级设置」标签页。' +
 			'改完点页面底部「保存并应用」，会自动同步防火墙并重启服务。');
 
 		/* 服务 */
@@ -795,13 +1454,24 @@ function decorate(formNode, onWoke) {
 		pickFields(GLOBAL_FIELDS, ['scan_mode', 'scan_interval', 'scan_online_sec'])
 			.forEach(function (def) { addField(s, def); });
 
-		/* 来源过滤 */
-		pickFields(GLOBAL_FIELDS, ['logread', 'ignore_foreign', 'cn_source',
-			'ignore_ipv6', 'wake_hairpin', 'blacklist_preset', 'whitelist', 'blacklist'])
+		/* 来源过滤（基础） */
+		pickFields(GLOBAL_FIELDS, ['geo_enabled', 'geo_source', 'geo_precise', 'ignore_foreign', 'cn_source',
+			'ignore_ipv6'])
 			.forEach(function (def) { addField(s, def); });
 
+		/* ---- ③ 高级设置 ---- */
+		s = m.section(form.TypedSection, 'advanced', _('高级设置'));
+		s.anonymous = true;
+		s.description = _('黑名单、自动黑名单、日志清理和维护操作。' +
+			'这些字段仍然写回原设置，不需要单独保存。');
+
+		/* 黑名单 / 自动黑名单 / 防火墙 */
+		pickFields(GLOBAL_FIELDS, ['blacklist_preset', 'wake_hairpin',
+			'autobl_enabled', 'autobl_per_min', 'autobl_total', 'autobl_expire', 'blacklist_fw'])
+			.forEach(function (def) { addAdvancedField(s, def); });
+
 		/* 日志清理 */
-		LOGCLEAN_FIELDS.forEach(function (def) { addField(s, def); });
+		LOGCLEAN_FIELDS.forEach(function (def) { addAdvancedField(s, def); });
 
 		var oClean = s.option(form.Button, '_logclean', _('手动操作'));
 		oClean.inputtitle = _('立即清理一次');
@@ -813,7 +1483,25 @@ function decorate(formNode, onWoke) {
 			});
 		};
 
-		/* ---- 维护操作（并入「设置」标签页）---- */
+		var oBackup = s.option(form.Button, '_logbackup', _('日志备份'));
+		oBackup.inputtitle = _('备份当前日志');
+		oBackup.inputstyle = 'action';
+		oBackup.onclick = function () {
+			return api.ctl('logbackup').then(function (r) {
+				ui.addNotification(null, E('p', {}, r.result));
+				return Promise.resolve();
+			});
+		};
+
+		var oExport = s.option(form.Button, '_logexport', _('日志导出'));
+		oExport.inputtitle = _('导出日志文件');
+		oExport.inputstyle = 'action';
+		oExport.onclick = function () {
+			window.location.href = '/cgi-bin/wol-log';
+			return Promise.resolve();
+		};
+
+		/* ---- 维护操作（并入「高级设置」标签页）---- */
 		var oRestart = s.option(form.Button, '_restart', _('服务'));
 		oRestart.inputtitle = _('重启服务');
 		oRestart.inputstyle = 'apply';
@@ -837,6 +1525,20 @@ function decorate(formNode, onWoke) {
 			'每周一凌晨 4:20 会自动检查一次（只有 OpenClash 的文件更新了才重建）。' +
 			'平时不需要手动点 —— 除非你刚更新了 OpenClash 的列表想立刻生效');
 
+		/* ---- 本地归属地库（仅「本地查询 + 本地精确查询」需要）---- */
+		var oGeo = s.option(form.Button, '_geodl', _('本地归属地库'));
+		oGeo.inputtitle = _('下载 / 更新本地库');
+		oGeo.inputstyle = 'action';
+		oGeo.description = _('仅「本地查询 + 本地精确查询」需要；约 7MB。' +
+			'下载完成后离线显示国家 / 省 / 市（IPv6 只能判断国内 / 国外）。');
+		oGeo.onclick = function () {
+			ui.addNotification(null, E('p', {}, _('正在下载本地归属地库（约 7MB），请稍候...')));
+			return api.ctl('geodl:force').then(function (r) {
+				ui.addNotification(null, E('p', {}, r.result));
+				return refreshAll();
+			});
+		};
+
 		/* ---- 保存后：同步防火墙 + 重启服务让设置立刻生效（黑名单/节流/扫描方式等）---- */
 		var origSave = m.save.bind(m);
 		m.save = function () {
@@ -845,7 +1547,18 @@ function decorate(formNode, onWoke) {
 					ui.addNotification(null, E('p', {}, _('已同步到防火墙设置') + '：' + r.result));
 					return api.ctl('restart').then(function () {
 						ui.addNotification(null, E('p', {}, _('服务已重启，新设置已生效')));
-						return refreshAll().then(function () { return res; });
+						return api.ctl('geodl:check').then(function (chk) {
+							if (chk && chk.result === 'need') {
+								ui.addNotification(null, E('p', {},
+									_('检测到已启用本地精确查询，正在下载本地库（约 7MB）...')));
+								return api.ctl('geodl').then(function (g) {
+									ui.addNotification(null, E('p', {}, g.result));
+								});
+							}
+							return null;
+						}).then(function () {
+							return refreshAll().then(function () { return res; });
+						});
 					});
 				});
 			});
@@ -853,24 +1566,28 @@ function decorate(formNode, onWoke) {
 
 		/* ==================== 组装 ==================== */
 		return m.render().then(function (formNode) {
-			var seenCard = E('div', {}, [
+			var activePane = formNode.querySelector('[data-tab-active="true"][data-tab]');
+			var activeName = activePane ? activePane.getAttribute('data-tab') : 'device';
+			function tabActive(name) { return activeName === name ? 'true' : 'false'; }
+
+			var seenCard = E('div', { class: 'cbi-section cbi-tblsection wo-list-card', 'data-wol-tab': 'device' }, [
 				E('h3', {}, _('可疑来源 IP')),
 				E('p', { style: 'margin:0 0 10px;color:#777;font-size:92%' },
 					_('国外来源全部列出；国内来源只列访问次数 ≥ 3 的（偶发访问多半是误报）。' +
 						'点「加入黑名单」后，这个来源再也不会触发唤醒（优先级最高）')),
-				seenBox
+				E('div', { class: 'cbi-section-node' }, [seenBox])
 			]);
 
-			var evCard = E('div', {}, [
+			var evCard = E('div', { class: 'cbi-section cbi-tblsection wo-list-card', 'data-wol-tab': 'device' }, [
 				E('h3', {}, _('最近唤醒记录')),
 				E('p', { style: 'margin:0 0 10px;color:#777;font-size:92%' },
-					_('最近 10 条触发记录（无论最终是否发起了唤醒）')),
-				evBox
+					_('可切换「成功唤醒」和「忽略记录」；每类默认显示最近 5 条，其余折叠。')),
+				E('div', { class: 'cbi-section-node' }, [evBox])
 			]);
 
-			var statusCard = E('div', { class: 'wo-card' }, [
-				E('h3', { style: 'margin:0 0 10px' }, _('状态')),
-				statusBox
+			var statusCard = E('div', { class: 'cbi-section cbi-tblsection wo-list-card', 'data-wol-tab': 'device' }, [
+				E('h3', {}, _('状态')),
+				E('div', { class: 'cbi-section-node' }, [statusBox])
 			]);
 
 			/*
@@ -884,14 +1601,54 @@ function decorate(formNode, onWoke) {
 				var devSec  = allSecs.length ? allSecs[0] : null;
 
 				if (devSec) {
-					devSec.insertBefore(statusBox, devSec.firstChild);  /* 状态卡放到设备列表上面 */
-					devSec.appendChild(evCard);                          /* 最近唤醒记录 */
-					devSec.appendChild(seenCard);                        /* 可疑来源 IP */
+					/* 独立卡片：和 section 同级，带 data-tab，交给 LuCI 原生分页显示/隐藏 */
+					var devParent = devSec.parentNode || formNode;
+					devParent.insertBefore(statusCard, devSec);
+					devParent.appendChild(evCard);
+					devParent.appendChild(seenCard);
 				} else {
 					formNode.appendChild(statusCard);
 					formNode.appendChild(evCard);
 					formNode.appendChild(seenCard);
 				}
+
+				/* 白名单 / 自定义黑名单：放进「设置」标签页 */
+				var cfgSec = allSecs.length > 1 ? allSecs[1] : null;
+				if (cfgSec) {
+					var wlStub = { cbid: function () { return 'wol-wl-list'; } };
+					var blStub = { cbid: function () { return 'wol-bl-list'; } };
+					var wlRoot = renderWhitelistEditor(wlStub, '',
+						m.data.get('wol_autowake', 'settings', 'whitelist'), initial);
+					var blRoot = renderBlacklistEditor(blStub, '',
+						m.data.get('wol_autowake', 'settings', 'blacklist'), initial);
+					var cardParent = cfgSec.parentNode || formNode;
+					cardParent.appendChild(E('div', { class: 'cbi-section cbi-tblsection wo-list-card', 'data-wol-tab': 'settings' }, [
+						E('h3', {}, _('白名单')),
+						E('div', { class: 'cbi-section-node' }, [wlRoot])
+					]));
+					cardParent.appendChild(E('div', { class: 'cbi-section cbi-tblsection wo-list-card', 'data-wol-tab': 'settings' }, [
+						E('h3', {}, _('自定义黑名单')),
+						E('div', { class: 'cbi-section-node' }, [blRoot])
+					]));
+				}
+
+				/* 卡片是渲染后追加的，监听原生标签页的 data-tab-active 变化来显隐 */
+				var cardEls = formNode.querySelectorAll('[data-wol-tab]');
+				var applyCards = function () {
+					var active = formNode.querySelector('[data-tab-active="true"][data-tab]');
+					var name = active ? active.getAttribute('data-tab') : 'device';
+					cardEls.forEach(function (el) {
+						el.style.display = (el.getAttribute('data-wol-tab') === name) ? '' : 'none';
+					});
+				};
+				try {
+					new MutationObserver(applyCards).observe(formNode, {
+						subtree: true,
+						attributes: true,
+						attributeFilter: ['data-tab-active']
+					});
+				} catch (e) { /* 忽略 */ }
+				setTimeout(applyCards, 0);
 			} catch (e) {
 				try {
 					formNode.appendChild(statusCard);
@@ -911,14 +1668,13 @@ function decorate(formNode, onWoke) {
 				}
 			} catch (e) { /* 忽略 */ }
 
-			/* 初次渲染直接用 load() 已经拿到的那份，不再重复请求 */
+			/* 首屏先用缓存，页面出来后立刻在后台拿一次实时状态 */
 			if (initial) {
 				paintStatus(initial);
 				paintSeen(initial);
 				paintEvents(initial);
-			} else {
-				refreshAll();
 			}
+			refreshAll();
 
 			decorate(formNode, refreshAll);
 
@@ -944,6 +1700,16 @@ function decorate(formNode, onWoke) {
 					/* ---- 新状态卡片 ---- */
 					'.wol-autowake .wo-card{padding:20px 26px 22px;}',
 					/* 四个数字：撑满整行，中间细线分隔 */
+					'.wol-autowake .wo-pills{display:flex;gap:8px;flex-wrap:wrap;margin:4px 0 12px;}',
+					'.wol-autowake .wo-pill{display:inline-flex;align-items:center;justify-content:center;gap:6px;',
+					'width:124px;height:26px;box-sizing:border-box;padding:0 10px;',
+					'border:1px solid;border-radius:999px;',
+					'font-size:86%;font-weight:600;line-height:1;white-space:nowrap;}',
+					'.wol-autowake .wo-pill-dot{width:7px;height:7px;border-radius:50%;flex:none;}',
+					'.wol-autowake .wo-filter-row{display:flex;flex-wrap:wrap;align-items:center;',
+					'gap:10px 18px;margin:2px 0 12px;}',
+					'.wol-autowake .wo-filter-item{display:inline-flex;align-items:center;gap:7px;white-space:nowrap;}',
+					'.wol-autowake .wo-label{font-size:92%;opacity:.6;}',
 					'.wol-autowake .wo-stats{display:flex;border:1px solid rgba(128,128,128,.18);',
 					'border-radius:11px;overflow:hidden;margin:0 0 20px;background:rgba(128,128,128,.035);}',
 					'.wol-autowake .wo-stat{flex:1;min-width:0;padding:20px 12px;text-align:center;',
@@ -973,17 +1739,47 @@ function decorate(formNode, onWoke) {
 					'.wol-autowake .cbi-section-table .cbi-button{padding:3px 10px;}',
 					/* 可疑来源表 / 最近唤醒表：固定列宽，全部居中，允许换行不溢出 */
 					'.wol-autowake table.wo-seen{table-layout:fixed;width:100%;}',
-					/* !important：主题对首列/单元格有更高优先级的 text-align，必须压过去 */
+										/* !important：主题对首列/单元格有更高优先级的 text-align，必须压过去 */
 					'.wol-autowake table.wo-seen th,.wol-autowake table.wo-seen td{',
 					'text-align:center !important;vertical-align:middle;padding:9px 6px;',
 					'white-space:normal;word-break:break-all;overflow-wrap:anywhere;}',
+					'.wol-autowake table.wo-seen td{height:61px;box-sizing:border-box;}',
 					'.wol-autowake table.wo-seen th:first-child,',
 					'.wol-autowake table.wo-seen td:first-child{text-align:center !important;}',
 					'.wol-autowake table.wo-seen td.wo-ip code{',
 					'font-size:105%;font-weight:700;letter-spacing:.2px;background:none;padding:0;',
 					'display:inline-block;text-align:center;}',
-					'.wol-autowake table.wo-seen .cbi-button{padding:4px 12px;font-size:92%;}',
 					'.wol-autowake table.wo-seen tbody tr:nth-child(even){background:rgba(128,128,128,.045);}',
+					'.wol-autowake table.wo-seen td:last-child{white-space:normal;}',
+					'.wol-autowake [data-tab][data-tab-active="false"]{display:none !important;}',
+					'.wol-autowake .wo-bl-editor{display:flex;flex-direction:column;gap:10px;}',
+					'.wol-autowake .wo-ro{width:100%;box-sizing:border-box;}',
+					'.wol-autowake .wo-list-card table.cbi-section-table{',
+					'table-layout:fixed;width:100%;}',
+					'.wol-autowake .wo-list-card table.cbi-section-table th,',
+					'.wol-autowake .wo-list-card table.cbi-section-table td{',
+					'text-align:center !important;}',
+					'.wol-autowake .wo-list-card table.cbi-section-table td .cbi-input-text{',
+					'text-align:center !important;}',
+					'.wol-autowake .wo-list-card table.cbi-section-table td.wo-bl-ops{',
+					'display:table-cell !important;text-align:center !important;vertical-align:middle;}',
+					'.wol-autowake .wo-list-card table.cbi-section-table td.wo-bl-ops .btn{',
+					'float:none !important;display:inline-block !important;margin:0 3px !important;}',
+					'.wol-autowake .cbi-section-table td .cbi-input-text{width:100%;box-sizing:border-box;}',
+					/* 黑白名单独立卡片：上下间隔 + 内边距 + 圆角 */
+					'.wol-autowake .cbi-section.wo-list-card{',
+					'margin:18px 0;padding:14px 16px 16px;border-radius:12px;overflow:hidden;}',
+					'.wol-autowake .cbi-section.wo-list-card .cbi-section-node{padding:0;}',
+					'.wol-autowake .cbi-section.wo-list-card > h3{',
+					'margin:0 0 12px;padding:0;border-radius:0;}',
+					'.wol-autowake .cbi-section.wo-list-card .cbi-section-create{',
+					'margin-top:12px;}',
+					/* 自定义表格字段占满整行，去掉左侧标题列的大片留白 */
+					'.wol-autowake .cbi-value.wo-wide{display:block !important;padding-left:0 !important;}',
+					'.wol-autowake .cbi-value.wo-wide > .cbi-value-title{',
+					'float:none !important;width:auto !important;display:block;margin:0 0 6px;}',
+					'.wol-autowake .cbi-value.wo-wide > .cbi-value-field{',
+					'margin-left:0 !important;width:auto !important;}',
 					/* 设置页功能卡片 */
 					'padding:14px 20px 8px;margin:0 0 16px;background:rgba(128,128,128,.03);}',
 					/* ★ 纯 CSS 卡片：每个字段行加边框，保证一定能看到效果 */
@@ -1001,7 +1797,7 @@ function decorate(formNode, onWoke) {
 					'.wol-autowake .cbi-section-table th,.wol-autowake .cbi-section-table td{',
 					'text-align:center;}',
 					'.wol-autowake .cbi-section-table input[type=checkbox]{margin:0 auto;display:block;}',
-					'.wol-autowake .cbi-section-table td:last-child{white-space:nowrap;}'
+					''
 				].join('')),
 				formNode
 			]);

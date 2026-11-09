@@ -1,0 +1,93 @@
+#!/bin/sh
+# ==============================================================================
+# wol-blfw -- 把黑名单 IPv4 同步到 fw4 防火墙（单 set + 两条固定规则）
+#
+#   设置项: wol_autowake.settings.blacklist_fw
+#     0 = 只忽略唤醒（默认）
+#     1 = 同时在 fw4 里 DROP 这些来源
+#
+#   fw4 原生结构:
+#     config ipset 'wol_bl4_fw'   family=4 match=ip loadfile=...
+#     rule WOLAUTO-BL-IN   src=wan ipset=wol_bl4_fw  -> DROP
+#     rule WOLAUTO-BL-FW   src=wan dest=lan ipset=... -> DROP
+#
+#   IP 增删只改 loadfile，然后 fw4 reload-sets；规则数量固定。
+# ==============================================================================
+
+. /lib/functions.sh
+
+FW_FILE="/etc/wol-autowake/blacklist.fw"
+SET_NAME="wol_bl4_fw"
+
+config_load wol_autowake
+config_get_bool FW settings blacklist_fw 0
+
+mkdir -p /etc/wol-autowake
+: > "$FW_FILE"
+
+if [ "$FW" = "1" ]; then
+	WH=$(uci -q get wol_autowake.settings.whitelist 2>/dev/null)
+	ips=$(ipset list wol_bl4 2>/dev/null | sed -n '/^Members:/,$p' | tail -n +2)
+	for ip in $ips; do
+		case "$ip" in
+			*:*) continue ;;
+		esac
+		case " $WH " in
+			*" $ip "*) continue ;;
+		esac
+		printf '%s\n' "$ip" >> "$FW_FILE"
+	done
+fi
+
+# 清掉旧版逐 IP 规则（WOLAUTO-BL-IN-<ip> / WOLAUTO-BL-FW-<ip>）
+while :; do
+	s=$(uci show firewall 2>/dev/null \
+		| sed -n "s/^firewall\.\([^.]*\)\.name='WOLAUTO-BL-[^']*-[0-9][^']*'/\1/p" \
+		| head -n 1)
+	[ -n "$s" ] || break
+	uci -q delete "firewall.$s"
+done
+
+# 找/建固定 ipset section
+s=$(uci show firewall 2>/dev/null \
+	| sed -n "s/^firewall\.\([^.]*\)\.name='$SET_NAME'/\1/p" | head -n 1)
+if [ -z "$s" ]; then
+	s=$(uci add firewall ipset)
+fi
+uci set "firewall.$s.name=$SET_NAME"
+uci set "firewall.$s.family=4"
+uci set "firewall.$s.match=ip"
+uci set "firewall.$s.loadfile=$FW_FILE"
+uci set "firewall.$s.maxelem=65536"
+uci set "firewall.$s.enabled=1"
+
+# 固定两条规则
+ensure_rule() {
+	local name="$1" src="$2" dest="$3"
+	local sec
+	sec=$(uci show firewall 2>/dev/null \
+		| sed -n "s/^firewall\.\([^.]*\)\.name='$name'/\1/p" | head -n 1)
+	if [ -z "$sec" ]; then
+		sec=$(uci add firewall rule)
+	fi
+	uci set "firewall.$sec.name=$name"
+	uci set "firewall.$sec.src=$src"
+	[ -n "$dest" ] && uci set "firewall.$sec.dest=$dest"
+	uci set "firewall.$sec.ipset=$SET_NAME"
+	uci set "firewall.$sec.proto=all"
+	uci set "firewall.$sec.target=DROP"
+	uci set "firewall.$sec.enabled=1"
+}
+
+ensure_rule "WOLAUTO-BL-IN" "wan" ""
+ensure_rule "WOLAUTO-BL-FW" "wan" "lan"
+
+uci commit firewall 2>/dev/null
+
+# 已经在跑：只刷新 set 内容；第一次/规则变更时需要 reload
+if nft list set inet fw4 "$SET_NAME" >/dev/null 2>&1; then
+	fw4 reload-sets >/dev/null 2>&1
+else
+	/etc/init.d/firewall reload >/dev/null 2>&1
+fi
+exit 0
