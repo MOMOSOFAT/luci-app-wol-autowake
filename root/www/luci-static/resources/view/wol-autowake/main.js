@@ -490,17 +490,25 @@ function decorate(formNode, onWoke) {
 			]));
 
 			/* ---- 四个数字块 ---- */
-			function tile(n, label, color) {
-				return E('div', { class: 'wo-stat' }, [
+			function tile(n, label, color, onClick) {
+				var d = E('div', { class: 'wo-stat' }, [
 					E('div', { class: 'n', style: color ? 'color:' + color : '' }, String(n)),
 					E('div', { class: 'l' }, label)
 				]);
+				if (onClick) {
+					d.style.cursor = 'pointer';
+					d.title = _('点击查看记录');
+					d.addEventListener('click', onClick);
+					d.addEventListener('mouseenter', function () { d.style.background = 'rgba(128,128,128,.10)'; });
+					d.addEventListener('mouseleave', function () { d.style.background = ''; });
+				}
+				return d;
 			}
 			statusBox.appendChild(E('div', { class: 'wo-stats' }, [
 				tile(s.total, _('设备总数')),
 				tile(s.online, _('当前在线'), s.online > 0 ? '#0a7a0a' : ''),
-				tile(Number(f.ign) || 0, _('今日忽略')),
-				tile(Number(f.woke) || 0, _('今日唤醒'), '#0a7a0a')
+				tile(Number(f.ign) || 0, _('今日忽略'), '', function () { setEvFilter('忽略'); }),
+				tile(Number(f.woke) || 0, _('今日唤醒'), '#0a7a0a', function () { setEvFilter('唤醒'); })
 			]));
 
 			/* ---- 三个状态标签 ---- */
@@ -683,30 +691,87 @@ function decorate(formNode, onWoke) {
 			}
 		}
 
-		/* ---------------- 最近唤醒记录（最近 10 条，含被忽略的）---------------- */
+		/* ---------------- 最近唤醒记录（可点击筛选：全部 / 今日唤醒 / 今日忽略）---------------- */
 		var evBox = E('div', {});
+		var evFilter = '';
+		var evLast = null;
+
+		function evPad2(n) { return (n < 10 ? '0' : '') + n; }
+		function evToday() {
+			var d = new Date();
+			return d.getFullYear() + '-' + evPad2(d.getMonth() + 1) + '-' + evPad2(d.getDate());
+		}
+
+		/* 点数字块或「显示全部」都会走这里；再次点同一个 = 取消筛选 */
+		function setEvFilter(kind) {
+			evFilter = (evFilter === kind) ? '' : kind;
+			try {
+				if (evBox && evBox.scrollIntoView)
+					evBox.scrollIntoView({ behavior: 'smooth', block: 'center' });
+			} catch (e) { }
+			paintEvents(evLast);
+		}
 
 		function paintEvents(st) {
+			if (st) evLast = st;
+			var src = evLast;
 			while (evBox.firstChild) evBox.removeChild(evBox.firstChild);
 
-			var list = (st && st.events) || [];
+			var all = (src && src.events) || [];
+			var list = all;
+			var ymd = evToday();
+
+			if (evFilter) {
+				list = all.filter(function (e) {
+					return e.kind === evFilter && String(e.ts || '').indexOf(ymd) === 0;
+				});
+				var bar = E('div', {
+					style: 'margin:0 0 12px;display:flex;align-items:center;gap:12px;flex-wrap:wrap'
+				}, [
+					E('span', {
+						style: 'font-weight:700;color:' + (evFilter === '唤醒' ? '#0a7a0a' : '#888')
+					}, evFilter === '唤醒' ? _('今日唤醒记录') : _('今日忽略记录')),
+					E('span', { style: 'opacity:.6' }, (function () {
+						var ff = (evLast && evLast.filter) || {};
+						var tot = Number(evFilter === '唤醒' ? ff.woke : ff.ign) || 0;
+						var s2 = _('共 ') + tot + _(' 条');
+						if (tot > list.length) s2 += _('（显示最近 ') + list.length + _(' 条）');
+						return s2;
+					})()),
+					E('a', {
+						href: '#', style: 'margin-left:auto;font-weight:600;text-decoration:none'
+					}, _('显示全部'))
+				]);
+				bar.lastChild.addEventListener('click', function (ev) {
+					if (ev && ev.preventDefault) ev.preventDefault();
+					evFilter = '';
+					paintEvents(evLast);
+				});
+				evBox.appendChild(bar);
+			}
+
 			if (!list.length) {
-				evBox.appendChild(E('em', {}, _('(暂无记录。设备关机后被外部连接一次，这里就会出现)')));
+				evBox.appendChild(E('em', {}, evFilter
+					? (_('(今天没有') + (evFilter === '唤醒' ? _('唤醒') : _('忽略')) + _('记录)'))
+					: _('(暂无记录。设备关机后被外部连接一次，这里就会出现)')));
 				return;
 			}
 
+			/* 未筛选时只显示最近 10 条；筛选时把今天符合条件的都列出来 */
+			var shown = evFilter ? list : list.slice(0, 10);
+
 			var tbody = E('tbody', {});
-			list.forEach(function (e) {
+			shown.forEach(function (e) {
 				var isWake = (e.kind === '唤醒');
 				tbody.appendChild(E('tr', {}, [
 					E('td', { class: 'wo-ip', style: 'text-align:center !important;white-space:nowrap' }, e.ts || ''),
 					E('td', {
 						style: 'color:' + (isWake ? '#0a7a0a' : '#999') + ';font-weight:bold'
 					}, e.kind || ''),
-					E('td', { class: 'wo-dev' , style: 'text-align:center !important' }, e.dev || ''),
+					E('td', { class: 'wo-dev', style: 'text-align:center !important' }, e.dev || ''),
 					E('td', { style: 'text-align:center !important' }, e.port || '-'),
-					E('td', { class: 'wo-ip' , style: 'text-align:center !important' }, (e.ip || '')),
-					E('td', { class: 'wo-dev' , style: 'text-align:center !important' }, e.why || '')
+					E('td', { class: 'wo-ip', style: 'text-align:center !important' }, (e.ip || '')),
+					E('td', { class: 'wo-dev', style: 'text-align:center !important' }, e.why || '')
 				]));
 			});
 
@@ -720,18 +785,19 @@ function decorate(formNode, onWoke) {
 					E('col', { style: 'width:23%' })
 				]),
 				E('thead', {}, E('tr', {}, [
-					E('th', { class: 'wo-ip' , style: 'text-align:center !important' }, _('时间')),
+					E('th', { class: 'wo-ip', style: 'text-align:center !important' }, _('时间')),
 					E('th', { style: 'text-align:center !important' }, _('结果')),
-					E('th', { class: 'wo-dev' , style: 'text-align:center !important' }, _('设备')),
+					E('th', { class: 'wo-dev', style: 'text-align:center !important' }, _('设备')),
 					E('th', { style: 'text-align:center !important' }, _('端口')),
-					E('th', { class: 'wo-ip' , style: 'text-align:center !important' }, _('来源 IP')),
-					E('th', { class: 'wo-dev' , style: 'text-align:center !important' }, _('说明'))
+					E('th', { class: 'wo-ip', style: 'text-align:center !important' }, _('来源 IP')),
+					E('th', { class: 'wo-dev', style: 'text-align:center !important' }, _('说明'))
 				])),
 				tbody
 			]);
 			evBox.appendChild(evTbl);
 			forceCenter(evTbl);
 		}
+
 
 		/* ---------------- 一次请求刷新所有 ---------------- */
 		function refreshAll() {
